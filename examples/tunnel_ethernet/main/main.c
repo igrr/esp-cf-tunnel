@@ -164,6 +164,7 @@ void app_main(void)
 #ifdef CONFIG_EXAMPLE_DEBUG_TUNNEL
     esp_log_level_set("cft_conn", ESP_LOG_DEBUG);
     esp_log_level_set("cft_rpc", ESP_LOG_DEBUG);
+    esp_log_level_set("cft_proxy", ESP_LOG_DEBUG);
 #endif
     /* Variables from the project's .env file, flashed to the "dotenv" partition */
     ESP_ERROR_CHECK(nvs_dotenv_load());
@@ -180,6 +181,9 @@ void app_main(void)
     cft_tunnel_config_t cfg = {
         .token = token,
         .on_request = on_request,
+#ifdef CONFIG_EXAMPLE_USE_INGRESS_RULES
+        .use_ingress_rules = true,
+#endif
     };
     ESP_ERROR_CHECK(cft_tunnel_start(&cfg, &s_tunnel));
 

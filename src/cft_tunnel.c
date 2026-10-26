@@ -4,6 +4,10 @@
  * exponential backoff and alternates regions; a slot whose connection the
  * edge drains is replaced right away under a free index, so requests keep
  * flowing while the old connection finishes.
+ *
+ * With use_ingress_rules, requests are routed by the ingress rules the edge
+ * pushes, to on_request or to the proxy; the proxy's origin sockets share
+ * the select loop through the poller.
  */
 #include <pthread.h>
 #include <stdatomic.h>
@@ -13,7 +17,10 @@
 
 #include "cf_tunnel.h"
 #include "cft_conn.h"
+#include "cft_ingress.h"
+#include "cft_poll.h"
 #include "cft_port.h"
+#include "cft_proxy.h"
 
 static const char *TAG = "cft_tunnel";
 
@@ -24,6 +31,7 @@ static const char *TAG = "cft_tunnel";
 #define BACKOFF_MAX_MS 60000
 #define POLL_MS 100 /* also the latency of cft_tunnel_post() */
 #define RX_BUF_SIZE 4096
+#define DEFAULT_MAX_ORIGINS 4
 
 typedef enum {
     SLOT_FREE,
@@ -71,7 +79,47 @@ struct cft_tunnel {
     pthread_mutex_t post_lock;
     post_t *posts;      /* oldest first */
     post_t **posts_tail;
+    cft_poller_t *poller;
+    cft_ingress_t *ingress;
+    int32_t ingress_version;
 };
+
+static void apply_config(cft_tunnel_t *t, const cft_event_t *ev)
+{
+    if (!t->cfg.use_ingress_rules || (t->ingress && ev->config.version <= t->ingress_version)) {
+        return;
+    }
+    cft_ingress_t *ing = cft_ingress_parse(ev->config.json, ev->config.json_len);
+    if (!ing) {
+        CFT_LOGW(TAG, "configuration version %ld has no usable ingress rules", (long)ev->config.version);
+        return;
+    }
+    cft_ingress_free(t->ingress);
+    t->ingress = ing;
+    t->ingress_version = ev->config.version;
+    CFT_LOGI(TAG, "applied ingress rules of configuration version %ld", (long)ev->config.version);
+}
+
+static void route_request(void *arg, cft_stream_t *s, const cft_request_t *req)
+{
+    cft_tunnel_t *t = arg;
+    const cft_ingress_rule_t *rule = t->ingress ? cft_ingress_match(t->ingress, req->authority, req->path) : NULL;
+    if (rule && !(t->cfg.on_request && cft_ingress_is_local(rule->service))) {
+        if (cft_proxy_start(s, rule->service, rule->host_header) < 0) {
+            cft_stream_fail(s, 502);
+        }
+        return;
+    }
+    if (rule && cft_stream_set_service(s, rule->service) < 0) {
+        cft_stream_fail(s, 500);
+        return;
+    }
+    if (t->cfg.on_request) {
+        t->cfg.on_request(t->cfg.request_arg, s, req);
+    } else {
+        cft_stream_respond(s, 404, NULL, NULL, 0);
+    }
+}
 
 /* Called by the connection; slot index = conn_index */
 static void on_conn_event(void *arg, const cft_event_t *ev)
@@ -96,6 +144,9 @@ static void on_conn_event(void *arg, const cft_event_t *ev)
         break;
     case CFT_EVENT_CLOSED:
         CFT_LOGI(TAG, "connection %u closed: %s", ev->conn_index, ev->closed.reason);
+        break;
+    case CFT_EVENT_CONFIG_UPDATED:
+        apply_config(t, ev);
         break;
     default:
         break;
@@ -204,12 +255,13 @@ static bool slot_connected(cft_tunnel_t *t, int i)
         .version = t->cfg.version ? t->cfg.version : DEFAULT_VERSION,
         .arch = t->cfg.arch ? t->cfg.arch : "unknown",
         .num_previous_attempts = s->attempts,
-        .on_request = t->cfg.on_request,
-        .request_arg = t->cfg.request_arg,
+        .on_request = route_request,
+        .request_arg = t,
         .on_event = on_conn_event,
         .event_arg = t,
         .max_request_body = t->cfg.max_request_body,
         .max_concurrent_streams = t->cfg.max_concurrent_streams,
+        .poller = t->poller,
     };
     s->conn_cfg.local_ip_len = t->tr.local_ip(s->tr, s->local_ip);
     s->conn_cfg.local_ip = s->conn_cfg.local_ip_len ? s->local_ip : NULL;
@@ -337,7 +389,10 @@ cft_tunnel_t *cft_tunnel_new(const cft_tunnel_config_t *cfg, const cft_transport
         t->connector_id[8] = (t->connector_id[8] & 0x3f) | 0x80;
     }
     t->rx = malloc(RX_BUF_SIZE);
-    if (!t->rx) {
+    t->poller = cft_poller_new(cfg->max_origin_connections ? cfg->max_origin_connections : DEFAULT_MAX_ORIGINS);
+    if (!t->rx || !t->poller) {
+        free(t->rx);
+        cft_poller_free(t->poller);
         free(t);
         return NULL;
     }
@@ -463,6 +518,8 @@ void cft_tunnel_run(cft_tunnel_t *t)
             }
         }
 
+        cft_poller_prepare(t->poller, &rfds, &wfds, &maxfd, &wake);
+
         int64_t wait = wake - now;
         if (wait < 0) {
             wait = 0;
@@ -475,6 +532,8 @@ void cft_tunnel_run(cft_tunnel_t *t)
         }
 
         now = cft_port_now_ms();
+        /* Origins first: what they produce goes out in the flushes below */
+        cft_poller_dispatch(t->poller, &rfds, &wfds, now);
         for (int i = 0; i < MAX_SLOTS; i++) {
             slot_t *s = &t->slots[i];
             if (s->state != SLOT_RUNNING) {
@@ -507,6 +566,8 @@ void cft_tunnel_free(cft_tunnel_t *t)
     }
     run_posts(t); /* let posters free what they passed */
     pthread_mutex_destroy(&t->post_lock);
+    cft_poller_free(t->poller);
+    cft_ingress_free(t->ingress);
     memset(&t->token, 0, sizeof(t->token));
     free(t->rx);
     free(t);

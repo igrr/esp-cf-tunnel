@@ -272,6 +272,33 @@ bool cft_json_get_raw(const char *json, size_t len, const char *key, const char 
     return true;
 }
 
+bool cft_json_array_next(const char *array, size_t len, const char **pos, const char **elem, size_t *elem_len)
+{
+    json_cur_t c = {.p = *pos ? *pos : array, .end = array + len};
+    json_ws(&c);
+    if (!*pos) {
+        if (c.p >= c.end || *c.p != '[') {
+            return false;
+        }
+        c.p++;
+        json_ws(&c);
+    } else if (c.p < c.end && *c.p == ',') {
+        c.p++;
+        json_ws(&c);
+    }
+    if (c.p >= c.end || *c.p == ']') {
+        return false;
+    }
+    const char *start = c.p;
+    if (!json_skip_value(&c)) {
+        return false;
+    }
+    *elem = start;
+    *elem_len = (size_t)(c.p - start);
+    *pos = c.p;
+    return true;
+}
+
 /* --- UUID --- */
 
 static int hexval(char c)

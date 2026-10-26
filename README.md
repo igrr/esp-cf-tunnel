@@ -6,14 +6,17 @@ speaks cloudflared's HTTP/2 transport.
 
 Status: works against the production edge from a Linux host and from an
 ESP32-P4 over Ethernet: HTTP requests with streamed request and response
-bodies, WebSockets, and up to four redundant connections. Not supported:
-private network routing (WARP), the QUIC transport.
+bodies, WebSockets, up to four redundant connections, and proxying to other
+hosts on the network (HTTP, WebSockets, and TCP for `cloudflared access`).
+Not supported: private network routing (WARP), the QUIC transport.
 
 ## Usage
 
 Create a remotely managed tunnel in the Cloudflare dashboard, add a public
-hostname to it (the service URL is not used; the device answers every
-request routed to the tunnel), and pass the tunnel token to the component:
+hostname to it, and pass the tunnel token to the component. By default the
+device answers every request routed to the tunnel, whatever the hostname's
+service URL; see [Reaching other devices](#reaching-other-devices) for
+routing by service.
 
 ```c
 #include "cf_tunnel_esp.h"
@@ -76,6 +79,50 @@ ID is derived from the MAC address, so after a reboot the edge replaces the
 old connections at once instead of routing requests to them until they time
 out.
 
+### Reaching other devices
+
+Like cloudflared, the device can pass requests on to other hosts on its
+network. With `use_ingress_rules` set, requests are routed by the public
+hostnames configured for the tunnel in the dashboard, which the edge sends to
+the device:
+
+| Service in the dashboard | Handled by |
+|---|---|
+| `http://localhost:PORT`, `http://127.0.0.1:PORT` | `on_request` on the device (`req->service` tells which) |
+| `http://HOST:PORT`, `ws://HOST:PORT` | HTTP/1.1 proxy to that host, WebSockets included |
+| `ssh://`, `rdp://`, `smb://`, `tcp://HOST:PORT` | TCP over WebSocket, for `cloudflared access ssh/rdp/tcp` on the visitor's side |
+| `http_status:CODE` | empty response with that status |
+
+```c
+cft_tunnel_config_t cfg = {
+    .token = tunnel_token,
+    .on_request = on_request,   /* for services on localhost */
+    .use_ingress_rules = true,
+};
+```
+
+Hostname wildcards (`*.example.com`), path regexes (POSIX extended syntax,
+which covers the common cases of Go's RE2) and `httpHostHeader` work as in
+cloudflared. Until the rules arrive, requests go to `on_request`. A handler
+can also proxy a request itself with `cft_stream_proxy(s, "http://...")`.
+
+Each proxied request opens its own connection to the origin, at most
+`max_origin_connections` at a time (default 4; more get 503). The proxy
+buffers at most about 16 KB in each direction per request, plus what the
+edge has in flight: an origin that reads slowly pauses the visitor's upload
+through HTTP/2 flow control (`cft_stream_pause_body()`, also available to
+handlers, e.g. for writing uploads to flash). Not supported: `https://`
+origins, unix sockets, cloudflared's built-in services, and private network
+routing (WARP). Host names in service URLs are resolved on the tunnel task,
+which blocks it briefly; IP addresses avoid that.
+
+The device connects only to hosts named in the tunnel's rules (or by the
+application), and anyone who can edit the tunnel in the dashboard can point
+it at any host the device can reach. Use Cloudflare Access on the public
+hostnames as you would with cloudflared.
+
+### TLS and memory
+
 The component needs `CONFIG_MBEDTLS_SSL_PROTO_TLS1_3=y`: the edge refuses
 TLS 1.2. The edge sends full 16 KB TLS records, but the device's own records
 can be small: `CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN=y` with
@@ -89,6 +136,12 @@ when idle (including the 8 KB task stack) and about 71 KB at peak, during a
 WebSocket session followed by a burst of 50 concurrent requests. The tunnel
 task used at most about 3 KB of its stack. Flash: 23 KB for this component and
 79 KB for nghttp2.
+
+Proxying to another host on the LAN, one request at a time, raised the peak
+by about 50 KB for HTTP (a 5 MB download at about 450 KB/s, a 3 MB upload at
+about 270 KB/s, an upload to an origin that stalls) and about 60 KB for a
+`cloudflared access tcp` session. Most of it is data the edge may send before
+the device's flow control stops it (64 KB per stream).
 
 ## How it works
 
@@ -106,7 +159,9 @@ task used at most about 3 KB of its stack. Flash: 23 KB for this component and
   `cf-cloudflared-response-headers` (`src/cft_conn.c`).
 
 `src/` holds the portable core: `cft_conn.c` handles one connection and does
-no I/O, `cft_tunnel.c` supervises the connections over a `cft_transport_ops_t`.
+no I/O, `cft_tunnel.c` supervises the connections over a `cft_transport_ops_t`
+and routes requests (`cft_ingress.c`), and `cft_proxy.c` talks to other hosts
+over non-blocking sockets in the same select loop (`cft_poll.c`).
 `port/esp/` provides the esp-tls transport and runs the tunnel in a task.
 
 ### Edge behaviour worth knowing
@@ -118,8 +173,8 @@ no I/O, `cft_tunnel.c` supervises the connections over a `cft_transport_ops_t`.
   pending requests with 502. cloudflared advertises no limit, so we don't
   either; requests over `max_concurrent_streams` get 503 from the connector.
 - Remotely managed tunnels get a configuration push on connection index 0.
-  The connector itself enforces the ingress rules, so every hostname routed
-  to the tunnel reaches the handler.
+  The connector itself enforces the ingress rules: the edge sends it every
+  request routed to the tunnel, whatever the hostname's service.
 
 ## Layout
 
@@ -158,14 +213,17 @@ test_apps/host/build/cft_host --token-file tunnel.token
 ```
 
 Requests routed to the tunnel are answered by the demo endpoints in
-`test_apps/host/main.c` (`/echo`, `/upload`, `/big?size=N`, `/later`, `/ws`,
-and a page showing the request for anything else). Ctrl-C unregisters the connections. Options:
-`--connections N`, `--connector-id UUID`, `--edge HOST[:PORT]`, `--plain`
-(no TLS, for the fake edge), `--handler-delay-ms N`, `--max-streams N`, `-v`.
+`test_apps/host/main.c` (`/echo`, `/upload`, `/pause`, `/big?size=N`,
+`/later`, `/ws`, and a page showing the request for anything else). Ctrl-C
+unregisters the connections. Options: `--connections N`, `--connector-id
+UUID`, `--edge HOST[:PORT]`, `--plain` (no TLS, for the fake edge),
+`--handler-delay-ms N`, `--max-streams N`, `--ingress` (route by the
+dashboard's public hostnames, proxying to other hosts), `--max-origins N`,
+`-v`.
 
 ## Host tests
 
-`test_apps/host/test_host.py` runs the host tests:
+`test_apps/host/test_host.py` and `test_proxy.py` run the host tests:
 
 - the registration RPC client against a mock server built on the reference
   Cap'n Proto implementation (pycapnp), with schemas in `test_apps/host/schemas`;
@@ -173,7 +231,9 @@ and a page showing the request for anything else). Ctrl-C unregisters the connec
   protocol (HTTP/2 client, control stream, registration, configuration
   pushes, drains, lost and unresponsive connections), covering streamed
   bodies and WebSockets too. The connector runs with AddressSanitizer and
-  UndefinedBehaviorSanitizer, and a leak check at exit.
+  UndefinedBehaviorSanitizer, and a leak check at exit;
+- proxying by ingress rules to HTTP, WebSocket and TCP origins on 127.0.0.2,
+  standing in for other hosts.
 
 ```sh
 pip install pytest pycapnp h2

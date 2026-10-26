@@ -10,6 +10,7 @@ loop runs in a background thread.
 import asyncio
 import base64
 import json
+import os
 import socket
 import threading
 import time
@@ -317,10 +318,56 @@ class FakeEdge:
     def wait(self, event, timeout=15):
         return self.call(asyncio.wait_for(event.wait(), timeout), timeout + 1)
 
-    def request(self, conn, method, path, headers=(), body=None, timeout=15):
-        return self.call(asyncio.wait_for(conn.request(method, path, headers, body), timeout), timeout + 1)
+    def request(self, conn, method, path, headers=(), body=None, timeout=15, authority="test.example.com"):
+        return self.call(asyncio.wait_for(conn.request(method, path, headers, body, authority), timeout), timeout + 1)
 
     def push_config(self, conn, version, config):
         body = json.dumps({"version": version, "config": config}).encode()
         resp = self.request(conn, "PUT", "/", [(UPGRADE, "update-configuration")], body)
         return resp, json.loads(resp.body)
+
+
+# --- WebSocket helpers (the visitor side) ---
+
+def ws_frame(opcode, payload, fin=True, mask=b"\x01\x02\x03\x04"):
+    """Masked client frame"""
+    hdr = bytes([(0x80 if fin else 0) | opcode])
+    n = len(payload)
+    if n < 126:
+        hdr += bytes([0x80 | n])
+    elif n < 65536:
+        hdr += bytes([0x80 | 126]) + n.to_bytes(2, "big")
+    else:
+        hdr += bytes([0x80 | 127]) + n.to_bytes(8, "big")
+    return hdr + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+
+
+class WsReader:
+    """Parses unmasked server frames from a stream's data chunks"""
+
+    def __init__(self, stream):
+        self.stream = stream
+        self.buf = b""
+
+    async def frame(self):
+        while True:
+            if len(self.buf) >= 2:
+                n = self.buf[1] & 0x7f
+                pos = 2
+                if n == 126:
+                    n, pos = int.from_bytes(self.buf[2:4], "big"), 4
+                elif n == 127:
+                    n, pos = int.from_bytes(self.buf[2:10], "big"), 10
+                if len(self.buf) >= pos + n:
+                    op, payload = self.buf[0] & 0x0f, self.buf[pos:pos + n]
+                    self.buf = self.buf[pos + n:]
+                    return op, payload
+            self.buf += await asyncio.wait_for(self.stream.chunks.get(), 5)
+
+
+def ws_open(conn, path="/ws", authority="test.example.com"):
+    key = base64.b64encode(os.urandom(16)).decode()
+    sid = conn.open_stream("GET", path, [("cf-cloudflared-proxy-connection-upgrade", "websocket"),
+                                         ("sec-websocket-key", key), ("sec-websocket-version", "13")],
+                           None, authority, end_stream=False)
+    return sid, key

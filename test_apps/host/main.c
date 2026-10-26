@@ -3,7 +3,11 @@
  * same supervisor as the device over OpenSSL.
  *
  *   cft_host --token-file PATH [--connections N] [--connector-id UUID]
- *            [--edge HOST[:PORT]] [--plain] [--handler-delay-ms N] [-v]
+ *            [--edge HOST[:PORT]] [--plain] [--handler-delay-ms N]
+ *            [--max-streams N] [--ingress] [--max-origins N] [-v]
+ *
+ * With --ingress, requests are routed by the tunnel's public hostnames:
+ * services on localhost come here, others are proxied.
  */
 #include <getopt.h>
 #include <pthread.h>
@@ -73,8 +77,8 @@ static void hello(cft_stream_t *s, const cft_request_t *req)
 {
     char body[4096];
     int n = snprintf(body, sizeof(body),
-                     "Hello from the esp-cf-tunnel host runner\n\n%s %s\nhost: %s\n\nheaders:\n",
-                     req->method, req->path, req->authority);
+                     "Hello from the esp-cf-tunnel host runner\n\n%s %s\nhost: %s\nservice: %s\n\nheaders:\n",
+                     req->method, req->path, req->authority, req->service ? req->service : "-");
     for (size_t i = 0; i < req->num_headers && n < (int)sizeof(body) - 1; i++) {
         n += snprintf(body + n, sizeof(body) - (size_t)n, "  %s: %s\n", req->headers[i].name,
                       req->headers[i].value);
@@ -197,6 +201,64 @@ static void later_close(cft_stream_t *s, void *ctx, bool completed)
     }
 }
 
+/* /pause: stops the request body at the first chunk for a second, then
+ * counts it. Freed like /later. */
+typedef struct {
+    cft_stream_t *s; /* NULL once closed */
+    size_t received;
+    bool paused_once;
+    bool resumed;
+} pause_t;
+
+static void pause_resume(void *arg)
+{
+    pause_t *p = arg;
+    p->resumed = true;
+    if (!p->s) {
+        free(p);
+        return;
+    }
+    cft_stream_pause_body(p->s, false);
+}
+
+static void *pause_thread(void *arg)
+{
+    usleep(1000 * 1000);
+    cft_tunnel_post(s_tunnel, pause_resume, arg);
+    return NULL;
+}
+
+static void pause_body(cft_stream_t *s, void *ctx, const uint8_t *data, size_t len)
+{
+    pause_t *p = ctx;
+    p->received += len;
+    if (!p->paused_once) {
+        p->paused_once = true;
+        cft_stream_pause_body(s, true);
+        pthread_t thread;
+        pthread_create(&thread, NULL, pause_thread, p);
+        pthread_detach(thread);
+    }
+}
+
+static void pause_end(cft_stream_t *s, void *ctx)
+{
+    pause_t *p = ctx;
+    char msg[64];
+    int n = snprintf(msg, sizeof(msg), "received %zu bytes\n", p->received);
+    cft_stream_respond(s, 200, "text/plain", msg, (size_t)n);
+}
+
+static void pause_close(cft_stream_t *s, void *ctx, bool completed)
+{
+    pause_t *p = ctx;
+    if (!p->paused_once || p->resumed) {
+        free(p);
+    } else {
+        p->s = NULL;
+    }
+}
+
 static void on_request(void *arg, cft_stream_t *s, const cft_request_t *req)
 {
     if (handler_delay_ms) {
@@ -215,6 +277,11 @@ static void on_request(void *arg, cft_stream_t *s, const cft_request_t *req)
         cft_stream_read_body(s, 0, upload_done, NULL);
     } else if (path_is(req, "/big")) {
         big(s, req);
+    } else if (path_is(req, "/pause")) {
+        pause_t *p = calloc(1, sizeof(*p));
+        p->s = s;
+        cft_stream_handlers_t h = {.on_body = pause_body, .on_body_end = pause_end, .on_close = pause_close};
+        cft_stream_set_handlers(s, &h, p);
     } else if (path_is(req, "/later")) {
         later_t *l = calloc(1, sizeof(*l));
         l->s = s;
@@ -273,12 +340,14 @@ int main(int argc, char **argv)
         {"plain", no_argument, NULL, 'p'},
         {"handler-delay-ms", required_argument, NULL, 'd'},
         {"max-streams", required_argument, NULL, 'm'},
+        {"ingress", no_argument, NULL, 'i'},
+        {"max-origins", required_argument, NULL, 'o'},
         {"verbose", no_argument, NULL, 'v'},
         {0},
     };
     int opt;
     const cft_transport_ops_t *transport = &cft_transport_openssl;
-    while ((opt = getopt_long(argc, argv, "t:n:c:e:pd:m:v", opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "t:n:c:e:pd:m:io:v", opts, NULL)) != -1) {
         switch (opt) {
         case 't': token_file = optarg; break;
         case 'n': cfg.num_connections = (uint8_t)atoi(optarg); break;
@@ -302,13 +371,16 @@ int main(int argc, char **argv)
         case 'p': transport = &cft_transport_plain; break;
         case 'd': handler_delay_ms = atoi(optarg); break;
         case 'm': cfg.max_concurrent_streams = (uint32_t)atoi(optarg); break;
+        case 'i': cfg.use_ingress_rules = true; break;
+        case 'o': cfg.max_origin_connections = (uint8_t)atoi(optarg); break;
         case 'v': cft_host_log_level = 3; break;
         default: return 2;
         }
     }
     if (!token_file) {
         fprintf(stderr, "usage: %s --token-file PATH [--connections N] [--connector-id UUID] "
-                "[--edge HOST[:PORT]] [--plain] [--handler-delay-ms N] [--max-streams N] [-v]\n", argv[0]);
+                "[--edge HOST[:PORT]] [--plain] [--handler-delay-ms N] [--max-streams N] [--ingress] "
+                "[--max-origins N] [-v]\n", argv[0]);
         return 2;
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -326,6 +398,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "invalid token\n");
         return 1;
     }
+    signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
     cft_tunnel_run(s_tunnel);

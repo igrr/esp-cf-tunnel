@@ -5,31 +5,17 @@ Run: pytest test_apps/host (needs pycapnp and h2)
 
 import asyncio
 import base64
-import json
 import os
 import signal
 import socket
 import subprocess
 import sys
 import time
-from pathlib import Path
 
 import pytest
 
-from fake_edge import FakeEdge
-
-HERE = Path(__file__).parent
-BUILD = Path(os.environ.get("CFT_HOST_BUILD", HERE / "build"))
-
-ACCOUNT = "0123456789abcdef0123456789abcdef"
-TUNNEL_ID = "e9b6087f-d155-4cca-bb1b-07a77bfc4306"
-SECRET = bytes(range(32))
-
-
-def free_port():
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+from conftest import ACCOUNT, BUILD, HERE, TUNNEL_ID, free_port
+from fake_edge import WsReader, ws_frame, ws_open
 
 
 # --- registration RPC against the reference Cap'n Proto implementation ---
@@ -63,50 +49,6 @@ def test_rpc(mock_server, args):
     r = subprocess.run([str(BUILD / "rpc_test"), str(mock_server), *args], capture_output=True, text=True,
                        timeout=20)
     assert r.returncode == 0, r.stdout + r.stderr
-
-
-# --- connector against the fake edge ---
-
-@pytest.fixture
-def edge():
-    e = FakeEdge()
-    yield e
-    e.stop()
-
-
-@pytest.fixture
-def token_file(tmp_path):
-    token = {"a": ACCOUNT, "t": TUNNEL_ID, "s": base64.b64encode(SECRET).decode()}
-    path = tmp_path / "tunnel.token"
-    path.write_text(base64.b64encode(json.dumps(token).encode()).decode())
-    return path
-
-
-@pytest.fixture
-def connector(edge, token_file, tmp_path):
-    procs = []
-
-    def start(*args):
-        log = open(tmp_path / f"connector{len(procs)}.log", "w")
-        p = subprocess.Popen([str(BUILD / "cft_host"), "--token-file", str(token_file), "--plain",
-                              "--edge", f"127.0.0.1:{edge.port}", "-v", *args],
-                             stdout=log, stderr=subprocess.STDOUT)
-        p.log_path = log.name
-        procs.append(p)
-        return p
-
-    yield start
-    for p in procs:
-        if p.poll() is None:
-            # A clean exit runs LeakSanitizer
-            p.send_signal(signal.SIGINT)
-            try:
-                p.wait(10)
-            except subprocess.TimeoutExpired:
-                p.kill()
-                p.wait()
-        log = Path(p.log_path).read_text()
-        assert "Sanitizer" not in log and "runtime error" not in log, log
 
 
 def test_register_and_request(edge, connector):
@@ -253,6 +195,24 @@ def test_streamed_request_and_response(edge, connector):
     assert got == [b"A" * 1000, b"B" * 1000, b"C" * 1000]
 
 
+def test_pause_body(edge, connector):
+    """While paused, the edge gets no more window than the stream already had"""
+    connector()
+    [conn] = edge.wait_registered()
+    body = b"p" * 1_000_000
+
+    async def upload():
+        sid = conn.open_stream("POST", "/pause", body=body)
+        await asyncio.sleep(0.7)
+        unsent = len(conn.pending.get(sid, [b""])[0])
+        await asyncio.wait_for(conn.streams[sid].done.wait(), 10)
+        return unsent, conn.streams.pop(sid).resp
+
+    unsent, resp = edge.call(upload())
+    assert unsent >= len(body) - 65535, unsent
+    assert resp.body == b"received 1000000 bytes\n"
+
+
 def test_post_from_another_thread(edge, connector):
     connector()
     [conn] = edge.wait_registered()
@@ -273,50 +233,6 @@ def test_streams_closed_with_connection(edge, connector):
 
 
 # --- WebSocket ---
-
-def ws_frame(opcode, payload, fin=True, mask=b"\x01\x02\x03\x04"):
-    """Masked client frame"""
-    hdr = bytes([(0x80 if fin else 0) | opcode])
-    n = len(payload)
-    if n < 126:
-        hdr += bytes([0x80 | n])
-    elif n < 65536:
-        hdr += bytes([0x80 | 126]) + n.to_bytes(2, "big")
-    else:
-        hdr += bytes([0x80 | 127]) + n.to_bytes(8, "big")
-    return hdr + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
-
-
-class WsReader:
-    """Parses unmasked server frames from a stream's data chunks"""
-
-    def __init__(self, stream):
-        self.stream = stream
-        self.buf = b""
-
-    async def frame(self):
-        while True:
-            if len(self.buf) >= 2:
-                n = self.buf[1] & 0x7f
-                pos = 2
-                if n == 126:
-                    n, pos = int.from_bytes(self.buf[2:4], "big"), 4
-                elif n == 127:
-                    n, pos = int.from_bytes(self.buf[2:10], "big"), 10
-                if len(self.buf) >= pos + n:
-                    op, payload = self.buf[0] & 0x0f, self.buf[pos:pos + n]
-                    self.buf = self.buf[pos + n:]
-                    return op, payload
-            self.buf += await asyncio.wait_for(self.stream.chunks.get(), 5)
-
-
-def ws_open(conn, path="/ws"):
-    key = base64.b64encode(os.urandom(16)).decode()
-    sid = conn.open_stream("GET", path, [("cf-cloudflared-proxy-connection-upgrade", "websocket"),
-                                         ("sec-websocket-key", key), ("sec-websocket-version", "13")],
-                           end_stream=False)
-    return sid, key
-
 
 def test_websocket_echo(edge, connector):
     import hashlib

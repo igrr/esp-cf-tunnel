@@ -2,6 +2,9 @@ idf_component_register(
     SRCS
         "src/cft_capnp.c"
         "src/cft_conn.c"
+        "src/cft_ingress.c"
+        "src/cft_poll.c"
+        "src/cft_proxy.c"
         "src/cft_rpc.c"
         "src/cft_token.c"
         "src/cft_tunnel.c"
@@ -11,5 +14,5 @@ idf_component_register(
     INCLUDE_DIRS "include"
     PRIV_INCLUDE_DIRS "src"
     REQUIRES esp-tls
-    PRIV_REQUIRES esp_timer esp_hw_support pthread
+    PRIV_REQUIRES esp_timer esp_hw_support pthread lwip
 )

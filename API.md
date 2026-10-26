@@ -31,6 +31,8 @@
 |  size\_t | [**cft\_stream\_buffered**](#function-cft_stream_buffered) (const [**cft\_stream\_t**](#typedef-cft_stream_t)\* s) <br>_Response bytes queued but not yet passed to the connection._ |
 |  int | [**cft\_stream\_end**](#function-cft_stream_end) ([**cft\_stream\_t**](#typedef-cft_stream_t)\* s) <br>_Ends the response once the queued data has been sent._ |
 |  const char \* | [**cft\_stream\_header**](#function-cft_stream_header) (const [**cft\_stream\_t**](#typedef-cft_stream_t)\* s, const char \* name) <br>_Value of a request header._ |
+|  void | [**cft\_stream\_pause\_body**](#function-cft_stream_pause_body) ([**cft\_stream\_t**](#typedef-cft_stream_t)\* s, bool pause) <br>_Stops or resumes the flow of request body data._ |
+|  int | [**cft\_stream\_proxy**](#function-cft_stream_proxy) ([**cft\_stream\_t**](#typedef-cft_stream_t)\* s, const char \* service) <br>_Passes the request on to another host, as cloudflared does._ |
 |  int | [**cft\_stream\_read\_body**](#function-cft_stream_read_body) ([**cft\_stream\_t**](#typedef-cft_stream_t)\* s, size\_t max\_len, void(\*)([**cft\_stream\_t**](#typedef-cft_stream_t)\*s, void \*ctx, const uint8\_t \*body, size\_t len) fn, void \* ctx) <br>_Collects the request body, then calls a function with it._ |
 |  const [**cft\_request\_t**](#struct-cft_request_t)\* | [**cft\_stream\_request**](#function-cft_stream_request) (const [**cft\_stream\_t**](#typedef-cft_stream_t)\* s) <br>_Request of this stream; valid until on\_close._ |
 |  void | [**cft\_stream\_reset**](#function-cft_stream_reset) ([**cft\_stream\_t**](#typedef-cft_stream_t)\* s) <br>_Aborts the stream (HTTP/2 RST\_STREAM); on\_close follows._ |
@@ -120,6 +122,8 @@ Variables:
 
 -  const char \* scheme  <br>"https" or "http"
 
+-  const char \* service  <br>Ingress service the request matched (e.g. "http://localhost:80"), or NULL
+
 ### struct `cft_stream_handlers_t`
 
 _Per-stream callbacks, see_ [_**cft\_stream\_set\_handlers()**_](#function-cft_stream_set_handlers) _._
@@ -184,6 +188,8 @@ Variables:
 
 -  uint32\_t max_concurrent_streams  <br>Open streams per connection, WebSockets included; more get 503. 0 means 16
 
+-  uint8\_t max_origin_connections  <br>Open connections to other hosts; more get 503. 0 means 4
+
 -  size\_t max_request_body  <br>Default limit of [**cft\_stream\_read\_body()**](#function-cft_stream_read_body)and of WebSocket messages; 0 means 16 KiB
 
 -  uint8\_t num_connections  <br>1..4; 0 means 1
@@ -195,6 +201,8 @@ Variables:
 -  void \* request_arg  <br>Passed to on\_request
 
 -  const char \* token  <br>Tunnel token; copied
+
+-  bool use_ingress_rules  <br>Route requests by the public hostnames configured in the dashboard: services on localhost go to on\_request (if set), others to [**cft\_stream\_proxy()**](#function-cft_stream_proxy). Without it, or until the edge sends the rules, all requests go to on\_request.
 
 -  const char \* version  <br>Reported to the edge; NULL for the component's
 
@@ -262,6 +270,56 @@ const char * cft_stream_header (
 **Returns:**
 
 The value, or NULL if the header is absent
+### function `cft_stream_pause_body`
+
+_Stops or resumes the flow of request body data._
+```c
+void cft_stream_pause_body (
+    cft_stream_t * s,
+    bool pause
+) 
+```
+
+While paused, the edge can still send what it was already allowed to (up to 64 KiB per stream), which on\_body receives as usual; then it waits. Use it when the body goes somewhere slower than the network, e.g. flash.
+
+
+
+**Parameters:**
+
+
+* `s` Stream 
+* `pause` true to stop, false to resume
+### function `cft_stream_proxy`
+
+_Passes the request on to another host, as cloudflared does._
+```c
+int cft_stream_proxy (
+    cft_stream_t * s,
+    const char * service
+) 
+```
+
+Services:
+* [http://host](http://host)[:port], ws://host[:port]: HTTP/1.1 proxy, WebSockets included;
+* ssh://, rdp://, smb://, tcp://host[:port]: TCP over WebSocket, the form `cloudflared access`uses on the visitor's side;
+* http\_status:CODE: an empty response with that status.
+
+Not supported: [https://](https://)and wss:// origins, unix sockets, and cloudflared's built-in services (hello\_world, bastion, socks5).
+
+Each request gets its own connection to the origin. The tunnel then owns the stream; do not set handlers. If the origin cannot be reached, the visitor gets 502; over max\_origin\_connections, 503. Resolving a host name blocks the tunnel's thread; IP addresses do not.
+
+
+
+**Parameters:**
+
+
+* `s` Stream, from on\_request 
+* `service` Service URL; copied 
+
+
+**Returns:**
+
+0 on success (a response follows), -1 if the service is not supported
 ### function `cft_stream_read_body`
 
 _Collects the request body, then calls a function with it._

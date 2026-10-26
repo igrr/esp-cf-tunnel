@@ -7,6 +7,9 @@
  * open. Each request arrives as a cft_stream_t on the tunnel's thread. On
  * ESP-IDF, use cf_tunnel_esp.h, which runs the tunnel in a task.
  *
+ * Requests can also be passed on to other hosts, like cloudflared does:
+ * see cft_tunnel_config_t.use_ingress_rules and cft_stream_proxy().
+ *
  * All functions except cft_tunnel_post() and cft_tunnel_request_stop() must
  * be called from the tunnel's thread, i.e. from the callbacks.
  */
@@ -36,6 +39,7 @@ typedef struct {
     size_t num_headers;          /*!< Number of entries in headers */
     int64_t content_length;      /*!< Request body length, or -1 if unknown */
     bool is_websocket;           /*!< The visitor asks for a WebSocket; see cft_ws_accept() */
+    const char *service;         /*!< Ingress service the request matched (e.g. "http://localhost:80"), or NULL */
 } cft_request_t;
 
 /** @brief One request and its response */
@@ -168,6 +172,41 @@ int cft_stream_respond(cft_stream_t *s, int status, const char *content_type, co
 void cft_stream_reset(cft_stream_t *s);
 
 /**
+ * @brief Stops or resumes the flow of request body data
+ *
+ * While paused, the edge can still send what it was already allowed to (up
+ * to 64 KiB per stream), which on_body receives as usual; then it waits.
+ * Use it when the body goes somewhere slower than the network, e.g. flash.
+ *
+ * @param s  Stream
+ * @param pause  true to stop, false to resume
+ */
+void cft_stream_pause_body(cft_stream_t *s, bool pause);
+
+/**
+ * @brief Passes the request on to another host, as cloudflared does
+ *
+ * Services:
+ * - http://host[:port], ws://host[:port]: HTTP/1.1 proxy, WebSockets included;
+ * - ssh://, rdp://, smb://, tcp://host[:port]: TCP over WebSocket, the form
+ *   `cloudflared access` uses on the visitor's side;
+ * - http_status:CODE: an empty response with that status.
+ *
+ * Not supported: https:// and wss:// origins, unix sockets, and cloudflared's
+ * built-in services (hello_world, bastion, socks5).
+ *
+ * Each request gets its own connection to the origin. The tunnel then owns
+ * the stream; do not set handlers. If the origin cannot be reached, the
+ * visitor gets 502; over max_origin_connections, 503. Resolving a host name
+ * blocks the tunnel's thread; IP addresses do not.
+ *
+ * @param s  Stream, from on_request
+ * @param service  Service URL; copied
+ * @return 0 on success (a response follows), -1 if the service is not supported
+ */
+int cft_stream_proxy(cft_stream_t *s, const char *service);
+
+/**
  * @brief Accepts a WebSocket request (req->is_websocket)
  *
  * Messages then arrive in on_ws_message. Pings are answered and the close
@@ -281,6 +320,11 @@ typedef struct {
     const char *arch;                /*!< Reported to the edge; NULL for "unknown" */
     size_t max_request_body;         /*!< Default limit of cft_stream_read_body() and of WebSocket messages; 0 means 16 KiB */
     uint32_t max_concurrent_streams; /*!< Open streams per connection, WebSockets included; more get 503. 0 means 16 */
+    bool use_ingress_rules;          /*!< Route requests by the public hostnames configured in the dashboard:
+                                          services on localhost go to on_request (if set), others to
+                                          cft_stream_proxy(). Without it, or until the edge sends the
+                                          rules, all requests go to on_request. */
+    uint8_t max_origin_connections;  /*!< Open connections to other hosts; more get 503. 0 means 4 */
 } cft_tunnel_config_t;
 
 /** @brief Tunnel handle */

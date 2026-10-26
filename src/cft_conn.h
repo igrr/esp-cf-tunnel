@@ -45,6 +45,7 @@ typedef struct {
     void *event_arg;
     size_t max_request_body;       /* default body / WebSocket message limit; 0 = 16 KiB */
     uint32_t max_concurrent_streams; /* open streams; more get 503. 0 = 16 */
+    struct cft_poller *poller;     /* origin sockets of cft_stream_proxy() */
 } cft_conn_config_t;
 
 typedef struct cft_conn cft_conn_t;
@@ -73,3 +74,16 @@ int cft_conn_shutdown(cft_conn_t *conn);
 
 /* True while the connection has not failed or finished. */
 bool cft_conn_is_alive(const cft_conn_t *conn);
+
+/* --- stream functions for the proxy (cft_proxy.c) --- */
+
+/* Error response from the connector rather than the origin (502, 504, ...) */
+int cft_stream_fail(cft_stream_t *s, int status);
+/* After cft_ws_accept(): the payload of data frames goes to on_body as it
+ * arrives, without message reassembly or size limit */
+void cft_stream_set_ws_raw(cft_stream_t *s);
+/* Sets cft_request_t.service; copied */
+int cft_stream_set_service(cft_stream_t *s, const char *service);
+struct cft_poller *cft_stream_poller(const cft_stream_t *s);
+/* The request body is complete */
+bool cft_stream_body_ended(const cft_stream_t *s);

@@ -36,6 +36,9 @@ set(CORE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../..)
 add_library(cf_tunnel STATIC
     ${CORE_DIR}/src/cft_capnp.c
     ${CORE_DIR}/src/cft_conn.c
+    ${CORE_DIR}/src/cft_ingress.c
+    ${CORE_DIR}/src/cft_poll.c
+    ${CORE_DIR}/src/cft_proxy.c
     ${CORE_DIR}/src/cft_rpc.c
     ${CORE_DIR}/src/cft_token.c
     ${CORE_DIR}/src/cft_tunnel.c

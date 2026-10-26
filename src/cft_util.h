@@ -31,6 +31,9 @@ bool cft_json_get_string(const char *json, size_t len, const char *key, char *ou
 bool cft_json_get_int(const char *json, size_t len, const char *key, int64_t *out);
 /* Raw text of a member's value (object, array, string with quotes, ...). */
 bool cft_json_get_raw(const char *json, size_t len, const char *key, const char **value, size_t *value_len);
+/* Iterates over the elements of an array: start with *pos = NULL. Returns
+ * false after the last element. */
+bool cft_json_array_next(const char *array, size_t len, const char **pos, const char **elem, size_t *elem_len);
 
 /* Parse "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" into 16 bytes. */
 bool cft_uuid_parse(const char *s, uint8_t out[16]);

@@ -93,6 +93,10 @@ struct cft_stream {
     bool upgrade_ws; /* the edge marked it as a WebSocket request */
     bool counted;    /* included in cft_conn.num_requests */
     bool body_ended; /* END_STREAM received */
+    char *service;   /* ingress service the request matched */
+    /* Flow control: received bytes not yet returned to the edge's window */
+    bool paused;
+    size_t held;
     /* Application */
     cft_stream_handlers_t h;
     void *ctx;
@@ -111,6 +115,7 @@ struct cft_stream {
     buf_t out;
     /* WebSocket */
     bool ws;
+    bool ws_raw; /* payload of data frames goes to on_body as it arrives */
     ws_rx_t wsr;
 };
 
@@ -147,6 +152,12 @@ static int buf_append(buf_t *b, const void *data, size_t len)
 {
     if (len == 0) {
         return 0;
+    }
+    if (b->off && b->len + len > b->cap) {
+        /* Reuse the space of data already passed on before growing */
+        memmove(b->p, b->p + b->off, b->len - b->off);
+        b->len -= b->off;
+        b->off = 0;
     }
     if (b->len + len > b->cap) {
         size_t cap = b->cap ? b->cap : 256;
@@ -216,6 +227,7 @@ static void stream_free(cft_stream_t *s)
     free(s->path);
     free(s->authority);
     free(s->scheme);
+    free(s->service);
     for (size_t i = 0; i < s->num_headers; i++) {
         free((char *)s->headers[i].name);
         free((char *)s->headers[i].value);
@@ -463,6 +475,45 @@ void cft_stream_reset(cft_stream_t *s)
     nghttp2_submit_rst_stream(s->conn->h2, NGHTTP2_FLAG_NONE, s->id, NGHTTP2_CANCEL);
 }
 
+void cft_stream_pause_body(cft_stream_t *s, bool pause)
+{
+    s->paused = pause;
+    if (!pause && s->held) {
+        nghttp2_session_consume_stream(s->conn->h2, s->id, s->held);
+        s->held = 0;
+    }
+}
+
+/* --- internal stream API (cft_conn.h) --- */
+
+int cft_stream_fail(cft_stream_t *s, int status)
+{
+    return respond_full(s, status, NULL, NULL, 0, META_CLOUDFLARED);
+}
+
+void cft_stream_set_ws_raw(cft_stream_t *s)
+{
+    s->ws_raw = true;
+}
+
+int cft_stream_set_service(cft_stream_t *s, const char *service)
+{
+    free(s->service);
+    s->service = service ? strdup(service) : NULL;
+    s->req.service = s->service;
+    return service && !s->service ? -1 : 0;
+}
+
+struct cft_poller *cft_stream_poller(const cft_stream_t *s)
+{
+    return s->conn->cfg.poller;
+}
+
+bool cft_stream_body_ended(const cft_stream_t *s)
+{
+    return s->body_ended;
+}
+
 /* --- WebSocket --- */
 
 static int ws_send_frame(cft_stream_t *s, uint8_t opcode, const void *data, size_t len)
@@ -578,7 +629,7 @@ static void ws_frame_done(cft_stream_t *s)
         }
         break;
     default:
-        if (w->fin && s->h.on_ws_message) {
+        if (w->fin && s->h.on_ws_message && !s->ws_raw) {
             s->h.on_ws_message(s, s->ctx, (cft_ws_opcode_t)w->msg_opcode, w->msg.p, w->msg.len);
         }
         if (w->fin) {
@@ -643,7 +694,7 @@ static void ws_feed(cft_stream_t *s, const uint8_t *data, size_t len)
                 if (w->opcode) {
                     w->msg_opcode = w->opcode;
                 }
-                if (w->msg.len + plen > max) {
+                if (!s->ws_raw && w->msg.len + plen > max) {
                     ws_fail(s, 1009, "message too big");
                     return;
                 }
@@ -658,6 +709,28 @@ static void ws_feed(cft_stream_t *s, const uint8_t *data, size_t len)
         }
         /* Payload */
         size_t k = len < w->payload_left ? len : (size_t)w->payload_left;
+        if (s->ws_raw && !(w->opcode & 0x08)) {
+            /* Unmask in pieces and pass on, without reassembling messages */
+            uint8_t tmp[256];
+            for (size_t i = 0; i < k;) {
+                size_t m = k - i < sizeof(tmp) ? k - i : sizeof(tmp);
+                for (size_t j = 0; j < m; j++) {
+                    tmp[j] = data[i + j] ^ w->mask[(w->payload_pos + i + j) & 3];
+                }
+                if (s->h.on_body) {
+                    s->h.on_body(s, s->ctx, tmp, m);
+                }
+                i += m;
+            }
+            data += k;
+            len -= k;
+            w->payload_pos += k;
+            w->payload_left -= k;
+            if (w->payload_left == 0) {
+                ws_frame_done(s);
+            }
+            continue;
+        }
         for (size_t i = 0; i < k; i++) {
             uint8_t b = data[i] ^ w->mask[(w->payload_pos + i) & 3];
             if (w->opcode & 0x08) {
@@ -809,6 +882,7 @@ static void build_request(cft_stream_t *s)
         .num_headers = s->num_headers,
         .content_length = -1,
         .is_websocket = s->upgrade_ws,
+        .service = s->service,
     };
     const char *cl = cft_stream_header(s, "content-length");
     if (cl) {
@@ -986,22 +1060,41 @@ static int on_frame_recv(nghttp2_session *session, const nghttp2_frame *frame, v
     return 0;
 }
 
+static void stream_deliver(cft_conn_t *c, cft_stream_t *s, const uint8_t *data, size_t len);
+
 static int on_data_chunk(nghttp2_session *session, uint8_t flags, int32_t stream_id, const uint8_t *data, size_t len,
                          void *user_data)
 {
     cft_conn_t *c = user_data;
     cft_stream_t *s = nghttp2_session_get_stream_user_data(session, stream_id);
+    /* The connection window is returned right away, so one paused stream
+     * does not hold up the others; the stream's window once it is consumed. */
+    nghttp2_session_consume_connection(session, len);
     if (!s) {
+        nghttp2_session_consume_stream(session, stream_id, len);
         return 0;
     }
+    stream_deliver(c, s, data, len);
+    /* The stream may have been reset, but not freed: that happens in
+     * on_stream_close, after this callback. */
+    if (s->paused) {
+        s->held += len;
+    } else {
+        nghttp2_session_consume_stream(session, stream_id, len);
+    }
+    return 0;
+}
+
+static void stream_deliver(cft_conn_t *c, cft_stream_t *s, const uint8_t *data, size_t len)
+{
     if (s->kind == STREAM_CONTROL) {
         if (s == c->control && c->rpc && cft_rpc_feed(c->rpc, data, len) < 0) {
             conn_fail(c, "control stream RPC error");
         }
-        return 0;
+        return;
     }
     if (s->resp_end && !s->ws) {
-        return 0; /* already answered (413, 503, ...) */
+        return; /* already answered (413, 503, ...) */
     }
     if (s->ws) {
         ws_feed(s, data, len);
@@ -1016,7 +1109,6 @@ static int on_data_chunk(nghttp2_session *session, uint8_t flags, int32_t stream
     } else if (s->h.on_body) {
         s->h.on_body(s, s->ctx, data, len);
     }
-    return 0;
 }
 
 static void close_stream(cft_conn_t *c, cft_stream_t *s, bool completed)
@@ -1089,7 +1181,16 @@ cft_conn_t *cft_conn_new(const cft_conn_config_t *cfg)
     nghttp2_session_callbacks_set_on_stream_close_callback(cbs, on_stream_close);
     nghttp2_session_callbacks_set_on_invalid_frame_recv_callback(cbs, on_invalid_frame);
     nghttp2_session_callbacks_set_on_frame_send_callback(cbs, on_frame_send);
-    int rv = nghttp2_session_server_new(&c->h2, cbs, c);
+    nghttp2_option *opt;
+    if (nghttp2_option_new(&opt) != 0) {
+        nghttp2_session_callbacks_del(cbs);
+        free(c);
+        return NULL;
+    }
+    /* Received data is acknowledged once consumed: see cft_stream_pause_body() */
+    nghttp2_option_set_no_auto_window_update(opt, 1);
+    int rv = nghttp2_session_server_new2(&c->h2, cbs, c, opt);
+    nghttp2_option_del(opt);
     nghttp2_session_callbacks_del(cbs);
     if (rv != 0) {
         free(c);
