@@ -104,7 +104,8 @@ static void run_connection(struct cft_tunnel *t, const char *host, uint8_t attem
         .common_name = CFT_EDGE_SNI, /* also used as SNI */
         .tls_version = ESP_TLS_VER_TLS_1_3,
         .timeout_ms = 10000,
-        .keep_alive_cfg = &(tls_keep_alive_cfg_t){
+        .keep_alive_cfg = &(tls_keep_alive_cfg_t)
+        {
             .keep_alive_enable = true,
             .keep_alive_idle = 30,
             .keep_alive_interval = 5,
@@ -131,7 +132,7 @@ static void run_connection(struct cft_tunnel *t, const char *host, uint8_t attem
     const uint8_t *local_ip = NULL;
     size_t local_ip_len = 0;
     if (local.ss_family == AF_INET) {
-        local_ip = (const uint8_t *)&((struct sockaddr_in *)&local)->sin_addr;
+        local_ip = (const uint8_t *) & ((struct sockaddr_in *)&local)->sin_addr;
         local_ip_len = 4;
     }
 

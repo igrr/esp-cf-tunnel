@@ -1,10 +1,10 @@
-/*
- * Cloudflare Tunnel connector: serves HTTP requests arriving through a tunnel
- * connection to the Cloudflare edge (HTTP/2 transport).
+/**
+ * @file cf_tunnel.h
+ * @brief Cloudflare Tunnel connector core: one HTTP/2 connection to the edge.
  *
  * cft_conn_t is one edge connection. It does no I/O itself: the caller
- * establishes TLS to the edge (see cft_edge_*), passes received bytes to
- * cft_conn_recv() and writes out what cft_conn_send_data() returns.
+ * establishes TLS to the edge, passes received bytes to cft_conn_recv() and
+ * writes out what cft_conn_send_data() returns.
  */
 #pragma once
 
@@ -16,27 +16,35 @@
 extern "C" {
 #endif
 
-/* --- Edge parameters --- */
-
+/** TCP port of the tunnel edge */
 #define CFT_EDGE_PORT 7844
+/** TLS server name to use for the HTTP/2 transport */
 #define CFT_EDGE_SNI "h2.cftunnel.com"
-/* Hostnames behind the _v2-origintunneld._tcp.argotunnel.com SRV record. */
+/** First edge region (target of the _v2-origintunneld._tcp.argotunnel.com SRV record) */
 #define CFT_EDGE_REGION1 "region1.v2.argotunnel.com"
+/** Second edge region */
 #define CFT_EDGE_REGION2 "region2.v2.argotunnel.com"
 
-/* PEM of the CA that signs the edge certificate, NUL-terminated. */
+/** PEM of the CA that signs the edge certificate, NUL-terminated */
 extern const char *const cft_edge_ca_pem_str;
 
-/* --- Token --- */
-
+/**
+ * @brief Decoded tunnel token
+ */
 typedef struct {
-    char account_tag[64];
-    uint8_t tunnel_id[16];
-    uint8_t secret[64];
-    size_t secret_len;
+    char account_tag[64];   /*!< Cloudflare account tag */
+    uint8_t tunnel_id[16];  /*!< Tunnel UUID */
+    uint8_t secret[64];     /*!< Tunnel secret */
+    size_t secret_len;      /*!< Length of the secret in bytes */
 } cft_token_t;
 
-/* Parses the token shown by the dashboard / `cloudflared tunnel token`. */
+/**
+ * @brief Parse a tunnel token
+ *
+ * @param token  Token as shown by the dashboard or `cloudflared tunnel token`
+ * @param[out] out  Decoded token
+ * @return true on success, false if the token is malformed
+ */
 bool cft_token_parse(const char *token, cft_token_t *out);
 
 /* --- Requests --- */

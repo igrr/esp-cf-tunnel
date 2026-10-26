@@ -262,7 +262,7 @@ int main(int argc, char **argv)
         .conn_index = (uint8_t)conn_index,
         .version = version,
         .arch = "linux_amd64",
-        .local_ip = (const uint8_t *)&local.sin_addr,
+        .local_ip = (const uint8_t *) &local.sin_addr,
         .local_ip_len = 4,
         .handler = demo_handler,
         .on_event = on_event,

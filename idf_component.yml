@@ -1,10 +1,14 @@
-version: "0.1.0"
-description: Cloudflare Tunnel connector (cloudflared HTTP/2 protocol)
+description: Cloudflare Tunnel connector for ESP-IDF, serving HTTP requests through a tunnel without cloudflared
+
 url: https://github.com/igrr/esp-cf-tunnel
+issues: https://github.com/igrr/esp-cf-tunnel/issues
+documentation: https://github.com/igrr/esp-cf-tunnel/tree/main/README.md
 repository: https://github.com/igrr/esp-cf-tunnel.git
+
 dependencies:
   idf: ">=5.4"
   espressif/nghttp: "^1.65.0"
+
 files:
   exclude:
     - "test_apps/**/*"

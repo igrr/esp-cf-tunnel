@@ -19,8 +19,8 @@ bool cft_token_parse(const char *token, cft_token_t *out)
         return false;
     }
     if (!cft_json_get_string(json, (size_t)n, "a", out->account_tag, sizeof(out->account_tag)) ||
-        !cft_json_get_string(json, (size_t)n, "t", tunnel_id, sizeof(tunnel_id)) ||
-        !cft_json_get_string(json, (size_t)n, "s", secret_b64, sizeof(secret_b64))) {
+            !cft_json_get_string(json, (size_t)n, "t", tunnel_id, sizeof(tunnel_id)) ||
+            !cft_json_get_string(json, (size_t)n, "s", secret_b64, sizeof(secret_b64))) {
         return false;
     }
     if (!cft_uuid_parse(tunnel_id, out->tunnel_id)) {

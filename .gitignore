@@ -6,3 +6,7 @@ managed_components/
 dependencies.lock
 compile_commands.json
 .env
+doxygen
+.cache
+.clangd
+__pycache__

@@ -153,7 +153,7 @@ static bool json_skip_value(json_cur_t *c)
     }
     /* number, true, false, null */
     while (c->p < c->end && *c->p != ',' && *c->p != '}' && *c->p != ']' && *c->p != ' ' && *c->p != '\n' &&
-           *c->p != '\r' && *c->p != '\t') {
+            *c->p != '\r' && *c->p != '\t') {
         c->p++;
     }
     return true;

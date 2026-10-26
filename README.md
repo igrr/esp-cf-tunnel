@@ -35,7 +35,11 @@ The handler runs in the tunnel task once the full request has arrived.
 Request bodies over `max_request_body` (16 KiB by default) get 413.
 
 The component needs `CONFIG_MBEDTLS_SSL_PROTO_TLS1_3=y`: the edge refuses
-TLS 1.2. `CONFIG_MBEDTLS_DYNAMIC_BUFFER=y` is recommended.
+TLS 1.2. The edge sends full 16 KB TLS records, but the device's own records
+can be small: `CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN=y` with
+`CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096` saves 12 KB.
+(`CONFIG_MBEDTLS_DYNAMIC_BUFFER` saves more, but IDF 5.x does not allow it
+together with TLS 1.3.)
 
 Measured on ESP32-P4 (internal RAM, no PSRAM; IDF v6.2-dev): the connected
 tunnel uses about 55 KB of heap when idle (including the 8 KB task stack) and
@@ -111,15 +115,30 @@ test_apps/host/build/cft_host --token-file tunnel.token
 Every request routed to the tunnel is answered by the demo handler in
 `test_apps/host/main.c`. Ctrl-C unregisters the connection.
 
-## RPC test
+## Host tests
 
-`rpc_test` checks the registration RPC client against a mock server built on
-the reference Cap'n Proto implementation (pycapnp). The schemas come from
-cloudflared (`tunnelrpc/proto/`) and go-capnproto2 (`std/capnp/rpc.capnp`,
-which imports `/capnp/c++.capnp`):
+`test_apps/host/test_host.py` runs the host tests, including the
+registration RPC client against a mock server built on the reference Cap'n
+Proto implementation (pycapnp). The schemas it needs are in
+`test_apps/host/schemas`.
 
 ```sh
-uv run --with pycapnp test_apps/host/mock_registration_server.py SCHEMA_DIR 18555 &
-test_apps/host/build/rpc_test 18555
-test_apps/host/build/rpc_test 18555 --fail
+pip install pytest pycapnp
+pytest test_apps/host
 ```
+
+## Contributing
+
+1. Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/);
+   [commitizen](https://commitizen-tools.github.io/commitizen/) (`cz commit`)
+   helps with the format.
+2. Install the pre-commit hooks before making changes: `pre-commit install`.
+   They format C code with astyle and regenerate [API.md](API.md) from the
+   public headers (needs doxygen).
+3. Releases: `cz bump` updates CHANGELOG.md and tags the version; pushing a
+   `v*` tag publishes the component to the ESP Component Registry.
+
+## License
+
+Apache 2.0, see [LICENSE.txt](LICENSE.txt). The Cap'n Proto schemas in
+`test_apps/host/schemas` keep their own licenses (see the README there).

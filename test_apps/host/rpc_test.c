@@ -67,7 +67,8 @@ int main(int argc, char **argv)
 
     static const uint8_t secret[32] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
     static const uint8_t tunnel_id[16] = {0xe9, 0xb6, 0x08, 0x7f, 0xd1, 0x55, 0x4c, 0xca,
-                                          0xbb, 0x1b, 0x07, 0xa7, 0x7b, 0xfc, 0x43, 0x06};
+                                          0xbb, 0x1b, 0x07, 0xa7, 0x7b, 0xfc, 0x43, 0x06
+                                         };
     static const uint8_t client_id[16] = {0xaa, 0xbb};
     static const uint8_t ip[4] = {192, 168, 1, 2};
     const char *features[] = {"serialized_headers", "allow_remote_config"};
