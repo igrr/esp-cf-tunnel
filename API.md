@@ -198,7 +198,11 @@ Variables:
 
 -   on_request  <br>Called for each request
 
+-  size\_t proxy_buffer_size  <br>Data buffered per proxied request in each direction, see [**cft\_stream\_proxy()**](#function-cft_stream_proxy). 0 means 16 KiB
+
 -  void \* request_arg  <br>Passed to on\_request
+
+-  uint32\_t stream_window  <br>HTTP/2 receive window per stream: how much request body the edge sends ahead. Bounds upload speed (window / round-trip time) and what a paused stream can still receive. 0 means 64 KiB
 
 -  const char \* token  <br>Tunnel token; copied
 

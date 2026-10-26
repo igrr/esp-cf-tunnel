@@ -46,6 +46,8 @@ typedef struct {
     size_t max_request_body;       /* default body / WebSocket message limit; 0 = 16 KiB */
     uint32_t max_concurrent_streams; /* open streams; more get 503. 0 = 16 */
     struct cft_poller *poller;     /* origin sockets of cft_stream_proxy() */
+    uint32_t stream_window;        /* HTTP/2 receive window per stream; 0 = 64 KiB */
+    size_t proxy_buffer_size;      /* per proxied request and direction; 0 = 16 KiB */
 } cft_conn_config_t;
 
 typedef struct cft_conn cft_conn_t;
@@ -84,6 +86,9 @@ int cft_stream_fail(cft_stream_t *s, int status);
 void cft_stream_set_ws_raw(cft_stream_t *s);
 /* Sets cft_request_t.service; copied */
 int cft_stream_set_service(cft_stream_t *s, const char *service);
-struct cft_poller *cft_stream_poller(const cft_stream_t *s);
+const cft_conn_config_t *cft_stream_config(const cft_stream_t *s);
+/* Also call on_writable once no more than `bytes` are left queued (0: only
+ * when all has been passed on) */
+void cft_stream_set_low_water(cft_stream_t *s, size_t bytes);
 /* The request body is complete */
 bool cft_stream_body_ended(const cft_stream_t *s);

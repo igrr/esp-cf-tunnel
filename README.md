@@ -141,7 +141,47 @@ Proxying to another host on the LAN, one request at a time, raised the peak
 by about 50 KB for HTTP (a 5 MB download at about 450 KB/s, a 3 MB upload at
 about 270 KB/s, an upload to an origin that stalls) and about 60 KB for a
 `cloudflared access tcp` session. Most of it is data the edge may send before
-the device's flow control stops it (64 KB per stream).
+the device's flow control stops it (64 KB per stream). These figures are for
+IDF's default lwIP settings; see below for faster ones.
+
+### Throughput
+
+Each connection's speed is bounded by window / round-trip time, and with
+IDF's defaults the bound is lwIP's: `CONFIG_LWIP_TCP_WND_DEFAULT` and
+`CONFIG_LWIP_TCP_SND_BUF_DEFAULT` are 5760 bytes, about 0.4 MB/s at the
+15-20 ms the device had to the edge. Settings, from the largest effect:
+
+| Setting | Effect |
+|---|---|
+| `CONFIG_LWIP_TCP_WND_DEFAULT`, `CONFIG_LWIP_TCP_SND_BUF_DEFAULT` | 32768 instead of 5760: downloads and uploads about 6-10 times faster. Raise `CONFIG_LWIP_TCP_RECVMBOX_SIZE` and `CONFIG_LWIP_TCPIP_RECVMBOX_SIZE` with them (64). 65535 was not faster. |
+| `stream_window` | HTTP/2 window per stream, 64 KiB by default: uploads (request bodies) are bounded by it once lwIP's window is larger. 128 KiB about doubled proxied uploads; 256 KiB was a little faster still. |
+| `proxy_buffer_size` | 16 KiB by default; 64 KiB made proxied downloads 10-15 % faster. |
+| `CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN` | 16384 instead of 4096 was not faster, and used 12 KB more. |
+
+Measured on the ESP32-P4 over 100 Mbit Ethernet with 5 MB transfers (3 MB
+for proxied uploads), through the production edge from a visitor with
+60 MB/s to Cloudflare. Rates depend on the edge location the device gets:
+the same build was about 1.7 times faster through Prague (prg) than through
+Frankfurt (fra).
+
+| Configuration | Edge | Download | Upload | Proxied download | Proxied upload | Peak heap above idle |
+|---|---|---|---|---|---|---|
+| IDF defaults (lwIP 5760), component defaults | fra | 0.4 MB/s | 0.2-0.4 MB/s | 0.3 MB/s | 0.2 MB/s | 18 KB, proxied 51 KB |
+| lwIP 32768 | prg | 3.3-4 MB/s | 0.9-2.7 MB/s | 3-3.2 MB/s | 0.8-0.9 MB/s | 75-82 KB, proxied 107 KB |
+| lwIP 32768, `stream_window` 128 KiB (the example) | fra | 1.8-2.3 MB/s | 0.8-2 MB/s | 1.9-2 MB/s | 1.7-1.9 MB/s | 47 KB, proxied 107 KB |
+| lwIP 32768, `stream_window` 256 KiB | fra | 2.1-2.5 MB/s | 1.3-2.2 MB/s | 1.9-2.1 MB/s | 1.9-2.1 MB/s | 47 KB, proxied 107 KB |
+| lwIP 32768, `stream_window` 256 KiB | prg | 4-4.1 MB/s | 1.9-4.2 MB/s | 3.8 MB/s | 3.3 MB/s | 76 KB, proxied 107 KB |
+
+Ranges span repeated runs; the first upload after connecting is the slowest
+(TCP slow start).
+
+Idle memory does not change with these settings; buffers grow during
+transfers. A larger `stream_window` costs nothing while the receiver keeps
+up, but a stream whose receiver is slow or paused can hold up to the whole
+window: a proxied upload to a slow host, or a handler using
+`cft_stream_pause_body()`. With `max_origin_connections` uploads at a time,
+that is up to that many windows. `examples/tunnel_ethernet` uses lwIP 32768
+and a 128 KiB window; both are in its `sdkconfig.defaults` and menuconfig.
 
 ## How it works
 
@@ -219,7 +259,7 @@ unregisters the connections. Options: `--connections N`, `--connector-id
 UUID`, `--edge HOST[:PORT]`, `--plain` (no TLS, for the fake edge),
 `--handler-delay-ms N`, `--max-streams N`, `--ingress` (route by the
 dashboard's public hostnames, proxying to other hosts), `--max-origins N`,
-`-v`.
+`--stream-window N`, `--proxy-buffer N`, `-v`.
 
 ## Host tests
 

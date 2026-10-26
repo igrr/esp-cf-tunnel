@@ -9,6 +9,14 @@ CONFIG_ESP_TLS_USING_MBEDTLS=y
 CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN=y
 CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=4096
+# Throughput: lwIP's TCP windows bound the speed of each connection
+# (window / round-trip time). IDF's default of 5760 bytes allows about
+# 0.4 MB/s to the edge; 32 KB allowed 2-4 MB/s, for 30-60 KB more RAM during
+# transfers. Use 5760 to save RAM.
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
+CONFIG_LWIP_TCP_WND_DEFAULT=32768
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=64
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
 # Partition table with the "dotenv" partition used by nvs-dotenv
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"

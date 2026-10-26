@@ -28,8 +28,7 @@ static const char *TAG = "cft_proxy";
 
 #define CONNECT_TIMEOUT_MS 30000 /* cloudflared's connectTimeout */
 #define READ_CHUNK 1024
-#define UP_HIGH (16 * 1024)      /* pause the request body above this */
-#define DOWN_HIGH (16 * 1024 - READ_CHUNK) /* stop reading the origin above this */
+#define DEFAULT_BUFFER (16 * 1024) /* per direction, see proxy_buffer_size */
 #define MAX_HEAD (16 * 1024)     /* response status line and headers */
 #define MAX_RESP_HEADERS 64
 
@@ -81,6 +80,8 @@ typedef struct {
     size_t line_len;
     bool reading;
     bool resp_started;
+    size_t up_high;   /* pause the request body above this */
+    size_t down_high; /* stop reading the origin above this */
 } proxy_t;
 
 /* --- buffers --- */
@@ -560,7 +561,7 @@ static void origin_eof(proxy_t *p)
 static void read_origin(proxy_t *p)
 {
     uint8_t buf[READ_CHUNK];
-    while (p->fd >= 0 && cft_stream_buffered(p->s) < DOWN_HIGH) {
+    while (p->fd >= 0 && cft_stream_buffered(p->s) < p->down_high) {
         ssize_t n = recv(p->fd, buf, sizeof(buf), 0);
         if (n == 0) {
             origin_eof(p);
@@ -576,7 +577,7 @@ static void read_origin(proxy_t *p)
         feed(p, buf, (size_t)n);
     }
     /* Resumed from on_writable once the edge has taken the queued data */
-    p->reading = p->fd >= 0 && cft_stream_buffered(p->s) < DOWN_HIGH;
+    p->reading = p->fd >= 0 && cft_stream_buffered(p->s) < p->down_high;
     update_want(p);
 }
 
@@ -656,7 +657,7 @@ static void on_body(cft_stream_t *s, void *ctx, const uint8_t *data, size_t len)
         origin_error(p, "out of memory");
         return;
     }
-    if (xbuf_pending(&p->up) + xbuf_pending(&p->early) > UP_HIGH) {
+    if (xbuf_pending(&p->up) + xbuf_pending(&p->early) > p->up_high) {
         cft_stream_pause_body(s, true);
     }
     if (p->state != P_CONNECTING) {
@@ -813,7 +814,8 @@ int cft_proxy_start(cft_stream_t *s, const char *service, const char *host_heade
         /* Reached with a browser rather than `cloudflared access` */
         return cft_stream_respond(s, 400, "text/plain", "Use cloudflared access to connect\n", 34);
     }
-    cft_poller_t *poller = cft_stream_poller(s);
+    const cft_conn_config_t *cfg = cft_stream_config(s);
+    cft_poller_t *poller = cfg->poller;
     if (!poller || cft_poller_full(poller)) {
         CFT_LOGW(TAG, "too many origin connections, answering 503");
         return cft_stream_fail(s, 503);
@@ -825,6 +827,10 @@ int cft_proxy_start(cft_stream_t *s, const char *service, const char *host_heade
     }
     p->s = s;
     p->fd = -1;
+    size_t buffer = cfg->proxy_buffer_size ? cfg->proxy_buffer_size : DEFAULT_BUFFER;
+    p->up_high = buffer;
+    /* A read can add READ_CHUNK more; stay within the buffer */
+    p->down_high = buffer > 2 * READ_CHUNK ? buffer - READ_CHUNK : READ_CHUNK;
     p->tcp = sc->tcp;
     p->upgrade = !sc->tcp && req->is_websocket;
     p->head_request = strcmp(req->method, "HEAD") == 0;
@@ -847,6 +853,8 @@ int cft_proxy_start(cft_stream_t *s, const char *service, const char *host_heade
         .on_close = on_close,
     };
     cft_stream_set_handlers(s, &h, p);
+    /* Read the origin again once half the queue has gone, not all of it */
+    cft_stream_set_low_water(s, p->down_high / 2);
     return 0;
 }
 

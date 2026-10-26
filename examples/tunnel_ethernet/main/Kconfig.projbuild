@@ -8,6 +8,23 @@ menu "Tunnel example"
             are served by this example; others, e.g. http://192.168.1.10:8080 or
             ssh://192.168.1.10:22, are proxied to that host.
 
+    config EXAMPLE_STREAM_WINDOW_KB
+        int "HTTP/2 receive window per stream (KiB)"
+        default 128
+        range 64 1024
+        help
+            How much request body the edge sends ahead (cft_tunnel_config_t.stream_window).
+            Larger is faster for uploads; a stream whose receiver is slow, e.g. a proxied
+            upload to a slow host, can hold up to this much in RAM.
+
+    config EXAMPLE_PROXY_BUFFER_KB
+        int "Buffer per proxied request and direction (KiB)"
+        default 16
+        range 4 256
+        help
+            cft_tunnel_config_t.proxy_buffer_size. Larger is a little faster for
+            proxied downloads.
+
     config EXAMPLE_DEBUG_TUNNEL
         bool "Debug logging for the tunnel connection (needs LOG_MAXIMUM_LEVEL_DEBUG)"
         default n

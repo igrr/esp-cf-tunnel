@@ -213,6 +213,24 @@ def test_pause_body(edge, connector):
     assert resp.body == b"received 1000000 bytes\n"
 
 
+def test_stream_window(edge, connector):
+    """A larger window lets the edge send that much ahead of a paused stream"""
+    connector("--stream-window", "262144")
+    [conn] = edge.wait_registered()
+    body = b"p" * 1_000_000
+
+    async def upload():
+        sid = conn.open_stream("POST", "/pause", body=body)
+        await asyncio.sleep(0.7)
+        unsent = len(conn.pending.get(sid, [b""])[0])
+        await asyncio.wait_for(conn.streams[sid].done.wait(), 10)
+        return unsent, conn.streams.pop(sid).resp
+
+    unsent, resp = edge.call(upload())
+    assert len(body) - 262144 <= unsent < len(body) - 65535, unsent
+    assert resp.body == b"received 1000000 bytes\n"
+
+
 def test_post_from_another_thread(edge, connector):
     connector()
     [conn] = edge.wait_registered()

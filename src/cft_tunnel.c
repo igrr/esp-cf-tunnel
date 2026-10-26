@@ -262,6 +262,8 @@ static bool slot_connected(cft_tunnel_t *t, int i)
         .max_request_body = t->cfg.max_request_body,
         .max_concurrent_streams = t->cfg.max_concurrent_streams,
         .poller = t->poller,
+        .stream_window = t->cfg.stream_window,
+        .proxy_buffer_size = t->cfg.proxy_buffer_size,
     };
     s->conn_cfg.local_ip_len = t->tr.local_ip(s->tr, s->local_ip);
     s->conn_cfg.local_ip = s->conn_cfg.local_ip_len ? s->local_ip : NULL;

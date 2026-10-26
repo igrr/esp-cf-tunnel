@@ -112,6 +112,7 @@ struct cft_stream {
     bool resp_eof_sent;
     bool deferred; /* data provider waits for cft_stream_write() */
     bool want_writable;
+    size_t low_water; /* also call on_writable when this little is left queued */
     buf_t out;
     /* WebSocket */
     bool ws;
@@ -301,6 +302,8 @@ static nghttp2_ssize read_out(nghttp2_session *session, int32_t stream_id, uint8
         } else if (s->kind == STREAM_HTTP) {
             s->want_writable = true;
         }
+    } else if (s->low_water && s->out.len - s->out.off <= s->low_water && !s->resp_end) {
+        s->want_writable = true;
     }
     return (nghttp2_ssize)n;
 }
@@ -504,9 +507,14 @@ int cft_stream_set_service(cft_stream_t *s, const char *service)
     return service && !s->service ? -1 : 0;
 }
 
-struct cft_poller *cft_stream_poller(const cft_stream_t *s)
+const cft_conn_config_t *cft_stream_config(const cft_stream_t *s)
 {
-    return s->conn->cfg.poller;
+    return &s->conn->cfg;
+}
+
+void cft_stream_set_low_water(cft_stream_t *s, size_t bytes)
+{
+    s->low_water = bytes;
 }
 
 bool cft_stream_body_ended(const cft_stream_t *s)
@@ -1200,7 +1208,23 @@ cft_conn_t *cft_conn_new(const cft_conn_config_t *cfg)
     /* No SETTINGS_MAX_CONCURRENT_STREAMS: the edge does not queue requests
      * at the limit but drops the connection with GOAWAY. cloudflared
      * advertises no limit either; excess requests get 503 instead. */
-    nghttp2_submit_settings(c->h2, NGHTTP2_FLAG_NONE, NULL, 0);
+    nghttp2_settings_entry iv[1];
+    size_t niv = 0;
+    uint32_t window = cfg->stream_window ? cfg->stream_window : NGHTTP2_INITIAL_WINDOW_SIZE;
+    if (window > (uint32_t)NGHTTP2_MAX_WINDOW_SIZE) {
+        window = NGHTTP2_MAX_WINDOW_SIZE;
+    }
+    if (window != NGHTTP2_INITIAL_WINDOW_SIZE) {
+        iv[niv++] = (nghttp2_settings_entry) {
+            NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, window
+        };
+    }
+    nghttp2_submit_settings(c->h2, NGHTTP2_FLAG_NONE, iv, niv);
+    /* Received data is returned to the connection window right away (see
+     * on_data_chunk), so one stream's window is enough for it too. */
+    if (window > NGHTTP2_INITIAL_CONNECTION_WINDOW_SIZE) {
+        nghttp2_session_set_local_window_size(c->h2, NGHTTP2_FLAG_NONE, 0, (int32_t)window);
+    }
     return c;
 }
 
@@ -1306,6 +1330,9 @@ static bool notify_writable(cft_conn_t *c)
 long cft_conn_send_data(cft_conn_t *c, const uint8_t **data)
 {
     for (;;) {
+        /* Streams below their low water get more data before it runs out */
+        while (notify_writable(c)) {
+        }
         nghttp2_ssize n = nghttp2_session_mem_send2(c->h2, data);
         if (n < 0) {
             conn_fail(c, nghttp2_strerror((int)n));

@@ -342,3 +342,14 @@ def test_config_update_replaces_rules(edge, tunnel, origins):
     # Older versions are ignored
     edge.push_config(conn, 1, ingress(origins))
     assert edge.request(conn, "GET", "/", authority="app.example.com").status == 404
+
+
+@pytest.mark.parametrize("size", ["4096", "131072"])
+def test_proxy_buffer_size(edge, tunnel, size):
+    conn = tunnel("--proxy-buffer", size, "--stream-window", "262144")
+    resp = edge.request(conn, "GET", "/big?size=1000000", authority="app.example.com", timeout=60)
+    assert resp.status == 200 and resp.body == bytes(ord("a") + i % 26 for i in range(1000000))
+    body = bytes(range(256)) * 2000
+    i = info(edge.request(conn, "POST", "/", [("content-length", str(len(body)))], body,
+                          authority="app.example.com"))
+    assert i["body_sha"] == hashlib.sha256(body).hexdigest()

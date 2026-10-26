@@ -184,6 +184,8 @@ void app_main(void)
 #ifdef CONFIG_EXAMPLE_USE_INGRESS_RULES
         .use_ingress_rules = true,
 #endif
+        .stream_window = CONFIG_EXAMPLE_STREAM_WINDOW_KB * 1024,
+        .proxy_buffer_size = CONFIG_EXAMPLE_PROXY_BUFFER_KB * 1024,
     };
     ESP_ERROR_CHECK(cft_tunnel_start(&cfg, &s_tunnel));
 

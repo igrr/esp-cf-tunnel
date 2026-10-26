@@ -325,6 +325,11 @@ typedef struct {
                                           cft_stream_proxy(). Without it, or until the edge sends the
                                           rules, all requests go to on_request. */
     uint8_t max_origin_connections;  /*!< Open connections to other hosts; more get 503. 0 means 4 */
+    uint32_t stream_window;          /*!< HTTP/2 receive window per stream: how much request body the edge
+                                          sends ahead. Bounds upload speed (window / round-trip time) and
+                                          what a paused stream can still receive. 0 means 64 KiB */
+    size_t proxy_buffer_size;        /*!< Data buffered per proxied request in each direction, see
+                                          cft_stream_proxy(). 0 means 16 KiB */
 } cft_tunnel_config_t;
 
 /** @brief Tunnel handle */

@@ -4,7 +4,8 @@
  *
  *   cft_host --token-file PATH [--connections N] [--connector-id UUID]
  *            [--edge HOST[:PORT]] [--plain] [--handler-delay-ms N]
- *            [--max-streams N] [--ingress] [--max-origins N] [-v]
+ *            [--max-streams N] [--ingress] [--max-origins N]
+ *            [--stream-window N] [--proxy-buffer N] [-v]
  *
  * With --ingress, requests are routed by the tunnel's public hostnames:
  * services on localhost come here, others are proxied.
@@ -342,12 +343,14 @@ int main(int argc, char **argv)
         {"max-streams", required_argument, NULL, 'm'},
         {"ingress", no_argument, NULL, 'i'},
         {"max-origins", required_argument, NULL, 'o'},
+        {"stream-window", required_argument, NULL, 'w'},
+        {"proxy-buffer", required_argument, NULL, 'b'},
         {"verbose", no_argument, NULL, 'v'},
         {0},
     };
     int opt;
     const cft_transport_ops_t *transport = &cft_transport_openssl;
-    while ((opt = getopt_long(argc, argv, "t:n:c:e:pd:m:io:v", opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "t:n:c:e:pd:m:io:w:b:v", opts, NULL)) != -1) {
         switch (opt) {
         case 't': token_file = optarg; break;
         case 'n': cfg.num_connections = (uint8_t)atoi(optarg); break;
@@ -373,6 +376,8 @@ int main(int argc, char **argv)
         case 'm': cfg.max_concurrent_streams = (uint32_t)atoi(optarg); break;
         case 'i': cfg.use_ingress_rules = true; break;
         case 'o': cfg.max_origin_connections = (uint8_t)atoi(optarg); break;
+        case 'w': cfg.stream_window = (uint32_t)strtoul(optarg, NULL, 0); break;
+        case 'b': cfg.proxy_buffer_size = strtoul(optarg, NULL, 0); break;
         case 'v': cft_host_log_level = 3; break;
         default: return 2;
         }
@@ -380,7 +385,7 @@ int main(int argc, char **argv)
     if (!token_file) {
         fprintf(stderr, "usage: %s --token-file PATH [--connections N] [--connector-id UUID] "
                 "[--edge HOST[:PORT]] [--plain] [--handler-delay-ms N] [--max-streams N] [--ingress] "
-                "[--max-origins N] [-v]\n", argv[0]);
+                "[--max-origins N] [--stream-window N] [--proxy-buffer N] [-v]\n", argv[0]);
         return 2;
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
