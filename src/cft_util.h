@@ -37,3 +37,6 @@ bool cft_uuid_parse(const char *s, uint8_t out[16]);
 
 /* Format 16 bytes as a UUID string; out must hold 37 bytes. */
 void cft_uuid_format(const uint8_t in[16], char out[37]);
+
+/* SHA-1 of data (for the WebSocket handshake) */
+void cft_sha1(const uint8_t *data, size_t len, uint8_t digest[20]);

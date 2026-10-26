@@ -1,5 +1,7 @@
 /*
  * Brings up Ethernet, then serves a status page through a Cloudflare Tunnel.
+ * The page opens a WebSocket to the device, which pushes the heap usage every
+ * second.
  */
 #include <inttypes.h>
 #include <stdio.h>
@@ -23,8 +25,13 @@ static const char *TAG = "example";
 static EventGroupHandle_t s_events;
 #define GOT_IP_BIT BIT0
 
+static cft_tunnel_handle_t s_tunnel;
 static uint32_t s_requests;
 static UBaseType_t s_tunnel_stack_free = UINT32_MAX;
+
+/* Open WebSockets; only touched on the tunnel task */
+#define MAX_WS 4
+static cft_stream_t *s_ws[MAX_WS];
 
 static void on_got_ip(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
@@ -57,16 +64,6 @@ static void ethernet_start(void)
     ESP_ERROR_CHECK(esp_eth_start(eth));
 }
 
-static const char *header_value(const cft_request_t *req, const char *name)
-{
-    for (size_t i = 0; i < req->num_headers; i++) {
-        if (strcmp(req->headers[i].name, name) == 0) {
-            return req->headers[i].value;
-        }
-    }
-    return "";
-}
-
 /* Compares the path part of a request target (before '?') with `path`. */
 static bool path_is(const cft_request_t *req, const char *path)
 {
@@ -74,52 +71,100 @@ static bool path_is(const cft_request_t *req, const char *path)
     return n == strlen(path) && strncmp(req->path, path, n) == 0;
 }
 
-/* Runs in the tunnel task. */
-static void handler(void *arg, const cft_request_t *req, cft_response_t *resp)
+static int status_json(char *buf, size_t size)
+{
+    return snprintf(buf, size,
+                    "{\"uptime_s\":%lld,\"requests\":%" PRIu32 ",\"heap_free\":%u,\"heap_min_free\":%u,"
+                    "\"internal_free\":%u,\"internal_min_free\":%u,\"tunnel_stack_free_min\":%u}",
+                    esp_timer_get_time() / 1000000, s_requests, (unsigned)esp_get_free_heap_size(),
+                    (unsigned)esp_get_minimum_free_heap_size(),
+                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                    (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+                    (unsigned)s_tunnel_stack_free);
+}
+
+static const char index_html[] =
+    "<!doctype html><html><head><meta charset=\"utf-8\"><title>" CONFIG_IDF_TARGET "</title></head><body>"
+    "<h1>Hello from " CONFIG_IDF_TARGET "</h1>"
+    "<p>Served through a Cloudflare Tunnel by the device itself.</p>"
+    "<p>Live status over a WebSocket: <code id=\"s\">connecting...</code></p>"
+    "<p><a href=\"/api/status\">/api/status</a></p>"
+    "<script>"
+    "const ws = new WebSocket((location.protocol == 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');"
+    "ws.onmessage = e => document.getElementById('s').textContent = e.data;"
+    "ws.onclose = () => document.getElementById('s').textContent += ' (closed)';"
+    "</script></body></html>\n";
+
+/* --- WebSocket: echoes messages, and gets the status every second --- */
+
+static void ws_message(cft_stream_t *s, void *ctx, cft_ws_opcode_t op, const uint8_t *data, size_t len)
+{
+    cft_ws_send(s, op, data, len);
+}
+
+static void ws_close(cft_stream_t *s, void *ctx, bool completed)
+{
+    for (int i = 0; i < MAX_WS; i++) {
+        if (s_ws[i] == s) {
+            s_ws[i] = NULL;
+        }
+    }
+}
+
+static void ws_open(cft_stream_t *s)
+{
+    for (int i = 0; i < MAX_WS; i++) {
+        if (!s_ws[i]) {
+            cft_stream_handlers_t h = {.on_ws_message = ws_message, .on_close = ws_close};
+            cft_stream_set_handlers(s, &h, NULL);
+            if (cft_ws_accept(s, NULL) == 0) {
+                s_ws[i] = s;
+            }
+            return;
+        }
+    }
+    cft_stream_respond(s, 503, "text/plain", "too many WebSockets\n", 20);
+}
+
+/* Posted from app_main to the tunnel task */
+static void ws_push_status(void *arg)
+{
+    char json[256];
+    int n = status_json(json, sizeof(json));
+    for (int i = 0; i < MAX_WS; i++) {
+        if (s_ws[i]) {
+            cft_ws_send(s_ws[i], CFT_WS_TEXT, json, (size_t)n);
+        }
+    }
+}
+
+/* Runs in the tunnel task when request headers arrive */
+static void on_request(void *arg, cft_stream_t *s, const cft_request_t *req)
 {
     s_requests++;
     UBaseType_t stack_free = uxTaskGetStackHighWaterMark(NULL);
     if (stack_free < s_tunnel_stack_free) {
         s_tunnel_stack_free = stack_free;
     }
-    char body[1024];
-    int n;
-    if (path_is(req, "/api/status")) {
-        n = snprintf(body, sizeof(body),
-                     "{\"uptime_s\":%lld,\"requests\":%" PRIu32 ",\"heap_free\":%u,\"heap_min_free\":%u,"
-                     "\"internal_free\":%u,\"internal_min_free\":%u,\"tunnel_stack_free_min\":%u}\n",
-                     esp_timer_get_time() / 1000000, s_requests, (unsigned)esp_get_free_heap_size(),
-                     (unsigned)esp_get_minimum_free_heap_size(),
-                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                     (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
-                     (unsigned)s_tunnel_stack_free);
-        cft_response_add_header(resp, "Content-Type", "application/json");
+    if (req->is_websocket && path_is(req, "/ws")) {
+        ws_open(s);
+    } else if (path_is(req, "/api/status")) {
+        char json[256];
+        int n = status_json(json, sizeof(json));
+        cft_stream_respond(s, 200, "application/json", json, (size_t)n);
     } else if (path_is(req, "/")) {
-        n = snprintf(body, sizeof(body),
-                     "<!doctype html><html><head><meta charset=\"utf-8\"><title>%s</title></head><body>"
-                     "<h1>Hello from %s</h1>"
-                     "<p>Served through a Cloudflare Tunnel by the device itself.</p>"
-                     "<ul><li>Uptime: %lld s</li><li>Requests served: %" PRIu32 "</li>"
-                     "<li>Free heap: %u bytes (minimum %u)</li><li>Your IP: %s (%s)</li></ul>"
-                     "<p><a href=\"/api/status\">/api/status</a></p></body></html>\n",
-                     CONFIG_IDF_TARGET, CONFIG_IDF_TARGET, esp_timer_get_time() / 1000000, s_requests,
-                     (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size(),
-                     header_value(req, "cf-connecting-ip"), header_value(req, "cf-ipcountry"));
-        cft_response_add_header(resp, "Content-Type", "text/html; charset=utf-8");
+        cft_stream_respond(s, 200, "text/html; charset=utf-8", index_html, sizeof(index_html) - 1);
     } else {
-        cft_response_set_status(resp, 404);
-        n = snprintf(body, sizeof(body), "not found\n");
-        cft_response_add_header(resp, "Content-Type", "text/plain");
+        cft_stream_respond(s, 404, "text/plain", "not found\n", 10);
     }
-    if (n >= (int)sizeof(body)) {
-        n = sizeof(body) - 1;
-    }
-    cft_response_add_header(resp, "Cache-Control", "no-store");
-    cft_response_set_body(resp, body, (size_t)n);
 }
 
 void app_main(void)
 {
+#ifdef CONFIG_EXAMPLE_DEBUG_TUNNEL
+    esp_log_level_set("cft_conn", ESP_LOG_DEBUG);
+    esp_log_level_set("cft_rpc", ESP_LOG_DEBUG);
+#endif
     /* Variables from the project's .env file, flashed to the "dotenv" partition */
     ESP_ERROR_CHECK(nvs_dotenv_load());
     const char *token = getenv("TUNNEL_TOKEN");
@@ -127,10 +172,6 @@ void app_main(void)
         ESP_LOGE(TAG, "TUNNEL_TOKEN is not set; add it to .env (see .env.example) and flash again");
         return;
     }
-#ifdef CONFIG_EXAMPLE_DEBUG_TUNNEL
-    esp_log_level_set("cft_conn", ESP_LOG_DEBUG);
-    esp_log_level_set("cft_rpc", ESP_LOG_DEBUG);
-#endif
     s_events = xEventGroupCreate();
     ethernet_start();
     xEventGroupWaitBits(s_events, GOT_IP_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
@@ -138,17 +179,19 @@ void app_main(void)
     ESP_LOGI(TAG, "heap before tunnel start: internal free %u", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     cft_tunnel_config_t cfg = {
         .token = token,
-        .handler = handler,
+        .on_request = on_request,
     };
-    cft_tunnel_handle_t tunnel;
-    ESP_ERROR_CHECK(cft_tunnel_start(&cfg, &tunnel));
+    ESP_ERROR_CHECK(cft_tunnel_start(&cfg, &s_tunnel));
 
-    for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(30000));
-        ESP_LOGI(TAG, "heap: free %u (min %u), internal free %u (min %u), largest internal block %u",
-                 (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size(),
-                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                 (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
-                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    for (int i = 0;; i++) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        cft_tunnel_post(cft_tunnel_get(s_tunnel), ws_push_status, NULL);
+        if (i % 30 == 0) {
+            ESP_LOGI(TAG, "heap: free %u (min %u), internal free %u (min %u), largest internal block %u",
+                     (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size(),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        }
     }
 }

@@ -1,11 +1,14 @@
-/*
- * Cloudflare Tunnel connector: serves HTTP requests that arrive through a
- * Cloudflare Tunnel, using cloudflared's HTTP/2 protocol.
+/**
+ * @file cf_tunnel.h
+ * @brief Cloudflare Tunnel connector: serves HTTP requests and WebSockets
+ * arriving through a Cloudflare Tunnel, using cloudflared's HTTP/2 protocol.
  *
- * cft_tunnel_t keeps the configured number of connections to the edge open,
- * reconnecting as needed. It runs on any platform that provides a
- * cft_transport_ops_t (TLS over a non-blocking socket); on ESP-IDF,
- * cf_tunnel_esp.h provides one and runs the tunnel in a task.
+ * A cft_tunnel_t keeps the configured number of connections to the edge
+ * open. Each request arrives as a cft_stream_t on the tunnel's thread. On
+ * ESP-IDF, use cf_tunnel_esp.h, which runs the tunnel in a task.
+ *
+ * All functions except cft_tunnel_post() and cft_tunnel_request_stop() must
+ * be called from the tunnel's thread, i.e. from the callbacks.
  */
 #pragma once
 
@@ -17,131 +20,309 @@
 extern "C" {
 #endif
 
-/* --- Requests --- */
-
+/** @brief HTTP header */
 typedef struct {
-    const char *name;
-    const char *value;
+    const char *name;  /*!< Header name; lower-case in requests */
+    const char *value; /*!< Header value */
 } cft_header_t;
 
+/** @brief Request, as received from the edge */
 typedef struct {
-    const char *method;
-    const char *path;
-    const char *authority;
-    const char *scheme;
-    const cft_header_t *headers; /* visitor headers, names lower-case */
-    size_t num_headers;
-    const uint8_t *body;
-    size_t body_len;
+    const char *method;          /*!< e.g. "GET" */
+    const char *path;            /*!< Path and query, e.g. "/api?x=1" */
+    const char *authority;       /*!< Host the visitor used */
+    const char *scheme;          /*!< "https" or "http" */
+    const cft_header_t *headers; /*!< Visitor's headers, plus Cloudflare's (cf-connecting-ip, ...) */
+    size_t num_headers;          /*!< Number of entries in headers */
+    int64_t content_length;      /*!< Request body length, or -1 if unknown */
+    bool is_websocket;           /*!< The visitor asks for a WebSocket; see cft_ws_accept() */
 } cft_request_t;
 
-typedef struct cft_response cft_response_t;
+/** @brief One request and its response */
+typedef struct cft_stream cft_stream_t;
 
-/* Status defaults to 200. Header and body data are copied. */
-void cft_response_set_status(cft_response_t *resp, int status);
-int cft_response_add_header(cft_response_t *resp, const char *name, const char *value);
-int cft_response_set_body(cft_response_t *resp, const void *data, size_t len);
-
-/* Called once the full request (including body) has arrived. */
-typedef void (*cft_handler_fn)(void *arg, const cft_request_t *req, cft_response_t *resp);
-
-/* --- Events --- */
-
+/** @brief WebSocket message types */
 typedef enum {
-    CFT_EVENT_REGISTERED,          /* connection is live */
-    CFT_EVENT_REGISTRATION_FAILED, /* edge refused; see retry fields */
-    CFT_EVENT_CONFIG_UPDATED,      /* remote configuration pushed by the edge */
-    CFT_EVENT_DRAINING,            /* edge asked to move off this connection */
-    CFT_EVENT_UNREGISTERED,        /* graceful shutdown acknowledged */
-    CFT_EVENT_CLOSED,              /* connection closed */
-} cft_event_type_t;
+    CFT_WS_TEXT = 1,   /*!< Text message (UTF-8) */
+    CFT_WS_BINARY = 2, /*!< Binary message */
+    CFT_WS_CLOSE = 8,  /*!< Close frame */
+    CFT_WS_PING = 9,   /*!< Ping frame */
+    CFT_WS_PONG = 10,  /*!< Pong frame */
+} cft_ws_opcode_t;
 
-typedef struct {
-    cft_event_type_t type;
-    uint8_t conn_index;            /* which connection (0..3) */
-    union {
-        struct {
-            char connection_id[37];
-            const char *location;
-            bool remotely_managed;
-        } registered;
-        struct {
-            const char *cause;
-            int64_t retry_after_ms;
-            bool should_retry;
-        } failed;
-        struct {
-            int32_t version;
-            const char *json; /* the "config" object, not NUL-terminated */
-            size_t json_len;
-        } config;
-        struct {
-            const char *reason;
-        } closed;
-    };
-} cft_event_t;
-
-typedef void (*cft_event_fn)(void *arg, const cft_event_t *ev);
-
-/* --- Transport --- */
-
-/*
- * TLS client over a non-blocking socket. All functions are called from the
- * tunnel's thread.
+/**
+ * @brief Per-stream callbacks, see cft_stream_set_handlers()
+ *
+ * All members are optional.
  */
 typedef struct {
-    /* Starts connecting. ca_pem verifies the server, sni is also the name to
-     * check. Returns a connection handle or NULL. May block for DNS. */
+    /** Part of the request body */
+    void (*on_body)(cft_stream_t *s, void *ctx, const uint8_t *data, size_t len);
+    /** The request body is complete (also called for requests without a body) */
+    void (*on_body_end)(cft_stream_t *s, void *ctx);
+    /** Everything written so far has been passed on; write more now */
+    void (*on_writable)(cft_stream_t *s, void *ctx);
+    /** A complete WebSocket text or binary message (after cft_ws_accept()) */
+    void (*on_ws_message)(cft_stream_t *s, void *ctx, cft_ws_opcode_t opcode, const uint8_t *data, size_t len);
+    /**
+     * The stream is gone: the response was sent, or the visitor or the
+     * connection went away. The stream must not be used afterwards; free ctx
+     * here. completed is true if the whole response was sent.
+     */
+    void (*on_close)(cft_stream_t *s, void *ctx, bool completed);
+} cft_stream_handlers_t;
+
+/**
+ * @brief Called when the headers of a new request have arrived
+ *
+ * Respond right away (cft_stream_respond()), read the body
+ * (cft_stream_read_body()), accept a WebSocket (cft_ws_accept()), or set
+ * handlers (cft_stream_set_handlers()) and respond later. A stream with no
+ * response stays open until the visitor gives up.
+ */
+typedef void (*cft_request_fn)(void *arg, cft_stream_t *s, const cft_request_t *req);
+
+/** @brief Request of this stream; valid until on_close */
+const cft_request_t *cft_stream_request(const cft_stream_t *s);
+
+/**
+ * @brief Value of a request header
+ *
+ * @param s  Stream
+ * @param name  Header name, lower-case
+ * @return The value, or NULL if the header is absent
+ */
+const char *cft_stream_header(const cft_stream_t *s, const char *name);
+
+/**
+ * @brief Sets the callbacks of a stream
+ *
+ * @param s  Stream
+ * @param handlers  Callbacks; copied
+ * @param ctx  Passed to the callbacks
+ */
+void cft_stream_set_handlers(cft_stream_t *s, const cft_stream_handlers_t *handlers, void *ctx);
+
+/**
+ * @brief Collects the request body, then calls a function with it
+ *
+ * Replaces the on_body and on_body_end handlers. Bodies over max_len get a
+ * 413 response, and fn is not called.
+ *
+ * @param s  Stream
+ * @param max_len  Largest accepted body; 0 for the tunnel's max_request_body
+ * @param fn  Called with the complete body (NULL and 0 if there is none)
+ * @param ctx  Passed to fn
+ * @return 0 on success, -1 if out of memory
+ */
+int cft_stream_read_body(cft_stream_t *s, size_t max_len,
+                         void (*fn)(cft_stream_t *s, void *ctx, const uint8_t *body, size_t len), void *ctx);
+
+/**
+ * @brief Starts the response
+ *
+ * Follow with cft_stream_write() and cft_stream_end(). Include
+ * content-length if known; otherwise the edge sends the body chunked.
+ *
+ * @param s  Stream
+ * @param status  HTTP status
+ * @param headers  Response headers; copied
+ * @param num_headers  Number of headers
+ * @return 0 on success, -1 on error (e.g. a response was already started)
+ */
+int cft_stream_send_headers(cft_stream_t *s, int status, const cft_header_t *headers, size_t num_headers);
+
+/**
+ * @brief Queues response body data
+ *
+ * The data is copied. To limit memory use, write more from on_writable
+ * rather than all at once.
+ *
+ * @return 0 on success, -1 on error
+ */
+int cft_stream_write(cft_stream_t *s, const void *data, size_t len);
+
+/**
+ * @brief Ends the response once the queued data has been sent
+ *
+ * @return 0 on success, -1 on error
+ */
+int cft_stream_end(cft_stream_t *s);
+
+/** @brief Response bytes queued but not yet passed to the connection */
+size_t cft_stream_buffered(const cft_stream_t *s);
+
+/**
+ * @brief Sends a complete response
+ *
+ * @param s  Stream
+ * @param status  HTTP status
+ * @param content_type  Content-Type, or NULL
+ * @param body  Body; copied
+ * @param len  Body length
+ * @return 0 on success, -1 on error
+ */
+int cft_stream_respond(cft_stream_t *s, int status, const char *content_type, const void *body, size_t len);
+
+/** @brief Aborts the stream (HTTP/2 RST_STREAM); on_close follows */
+void cft_stream_reset(cft_stream_t *s);
+
+/**
+ * @brief Accepts a WebSocket request (req->is_websocket)
+ *
+ * Messages then arrive in on_ws_message. Pings are answered and the close
+ * handshake is handled; on_close follows.
+ *
+ * @param s  Stream
+ * @param subprotocol  Sec-WebSocket-Protocol to confirm, or NULL
+ * @return 0 on success, -1 if the request is not a valid WebSocket request
+ */
+int cft_ws_accept(cft_stream_t *s, const char *subprotocol);
+
+/**
+ * @brief Sends a WebSocket message
+ *
+ * @param s  Stream
+ * @param opcode  CFT_WS_TEXT, CFT_WS_BINARY, CFT_WS_PING or CFT_WS_PONG
+ * @param data  Payload; copied
+ * @param len  Payload length
+ * @return 0 on success, -1 on error
+ */
+int cft_ws_send(cft_stream_t *s, cft_ws_opcode_t opcode, const void *data, size_t len);
+
+/**
+ * @brief Closes a WebSocket
+ *
+ * @param s  Stream
+ * @param code  Close status, e.g. 1000
+ * @param reason  Reason text, or NULL
+ * @return 0 on success, -1 on error
+ */
+int cft_ws_close(cft_stream_t *s, uint16_t code, const char *reason);
+
+/** @brief Connection events */
+typedef enum {
+    CFT_EVENT_REGISTERED,          /*!< Connection is registered and serving */
+    CFT_EVENT_REGISTRATION_FAILED, /*!< The edge refused the connection */
+    CFT_EVENT_CONFIG_UPDATED,      /*!< The edge pushed the remote configuration */
+    CFT_EVENT_DRAINING,            /*!< The edge asked to move off this connection */
+    CFT_EVENT_UNREGISTERED,        /*!< Graceful shutdown acknowledged */
+    CFT_EVENT_CLOSED,              /*!< Connection closed */
+} cft_event_type_t;
+
+/** @brief Connection event */
+typedef struct {
+    cft_event_type_t type; /*!< Event type */
+    uint8_t conn_index;    /*!< Which connection (0..3) */
+    union {
+        struct {
+            char connection_id[37]; /*!< UUID the edge assigned to the connection */
+            const char *location;   /*!< Edge data center, e.g. "fra12" */
+            bool remotely_managed;  /*!< The tunnel is configured in the dashboard */
+        } registered;               /*!< CFT_EVENT_REGISTERED */
+        struct {
+            const char *cause;      /*!< Reason given by the edge */
+            int64_t retry_after_ms; /*!< Requested delay before retrying */
+            bool should_retry;      /*!< Whether retrying may help */
+        } failed;                   /*!< CFT_EVENT_REGISTRATION_FAILED */
+        struct {
+            int32_t version;  /*!< Configuration version */
+            const char *json; /*!< The "config" object, not NUL-terminated */
+            size_t json_len;  /*!< Length of json */
+        } config;             /*!< CFT_EVENT_CONFIG_UPDATED */
+        struct {
+            const char *reason; /*!< Why the connection closed */
+        } closed;               /*!< CFT_EVENT_CLOSED */
+    };                          /*!< Event data, by type */
+} cft_event_t;
+
+/** @brief Called for connection events on the tunnel's thread */
+typedef void (*cft_event_fn)(void *arg, const cft_event_t *ev);
+
+/**
+ * @brief TLS client over a non-blocking socket
+ *
+ * Implemented by each platform; called from the tunnel's thread.
+ */
+typedef struct {
+    /** Starts connecting; returns a connection handle or NULL. May block for DNS. */
     void *(*open)(void *ctx, const char *host, uint16_t port, const char *sni, const char *ca_pem);
-    /* Advances the connection and handshake: 1 done, 0 in progress, -1 failed */
+    /** Advances the connection and handshake: 1 done, 0 in progress, -1 failed */
     int (*connect)(void *conn);
-    /* Socket to wait on */
+    /** Socket to wait on */
     int (*get_fd)(void *conn);
-    /* >0 bytes read, 0 nothing available now, <0 closed or failed */
+    /** Returns >0 bytes read, 0 if nothing is available now, <0 if closed or failed */
     long (*read)(void *conn, uint8_t *buf, size_t len);
-    /* >=0 bytes written (0: try again later), <0 failed. After a short write,
-     * the next call must pass the remaining bytes again. */
+    /** Returns >=0 bytes written (0: try later), <0 if failed. After a short write, pass the rest again. */
     long (*write)(void *conn, const uint8_t *buf, size_t len);
-    /* Decrypted bytes buffered in the transport, readable without waiting */
+    /** Decrypted bytes buffered in the transport, readable without waiting */
     size_t (*pending)(void *conn);
-    /* Local address of the socket; returns its length (4 or 16) or 0 */
+    /** Local address of the socket; returns its length (4 or 16) or 0 */
     size_t (*local_ip)(void *conn, uint8_t ip[16]);
+    /** Closes the connection and frees the handle */
     void (*close)(void *conn);
+    /** Passed to open() */
     void *ctx;
 } cft_transport_ops_t;
 
-/* --- Tunnel --- */
-
+/** @brief Tunnel configuration */
 typedef struct {
-    const char *token;               /* tunnel token; copied */
-    cft_handler_fn handler;          /* called from the tunnel thread */
-    void *handler_arg;
-    cft_event_fn on_event;           /* optional, called from the tunnel thread */
-    void *event_arg;
-    uint8_t num_connections;         /* 1..4; 0 = 1 */
-    const uint8_t *connector_id;     /* 16 bytes; NULL = random. Keep it stable across restarts:
-                                        the edge then replaces the connections of the previous run
-                                        instead of routing requests to them until they time out. */
-    const char *edge_hosts[2];       /* edge addresses (one per region); NULL = Cloudflare's */
-    uint16_t edge_port;              /* 0 = 7844 */
-    const char *version;             /* reported to the edge; NULL = component default */
-    const char *arch;                /* reported to the edge; NULL = "unknown" */
-    size_t max_request_body;         /* larger requests get 413; 0 = 16 KiB */
-    uint32_t max_concurrent_streams; /* requests in flight per connection; more get 503. 0 = 16 */
+    const char *token;               /*!< Tunnel token; copied */
+    cft_request_fn on_request;       /*!< Called for each request */
+    void *request_arg;               /*!< Passed to on_request */
+    cft_event_fn on_event;           /*!< Optional */
+    void *event_arg;                 /*!< Passed to on_event */
+    uint8_t num_connections;         /*!< 1..4; 0 means 1 */
+    const uint8_t *connector_id;     /*!< 16 bytes, or NULL for a random one. Keep it stable across restarts:
+                                          the edge then replaces the previous run's connections right away. */
+    const char *edge_hosts[2];       /*!< Edge addresses, one per region; NULL for Cloudflare's */
+    uint16_t edge_port;              /*!< 0 means 7844 */
+    const char *version;             /*!< Reported to the edge; NULL for the component's */
+    const char *arch;                /*!< Reported to the edge; NULL for "unknown" */
+    size_t max_request_body;         /*!< Default limit of cft_stream_read_body() and of WebSocket messages; 0 means 16 KiB */
+    uint32_t max_concurrent_streams; /*!< Open streams per connection, WebSockets included; more get 503. 0 means 16 */
 } cft_tunnel_config_t;
 
+/** @brief Tunnel handle */
 typedef struct cft_tunnel cft_tunnel_t;
 
-/* Returns NULL if the token is invalid or memory runs out. */
+/**
+ * @brief Creates a tunnel
+ *
+ * @param cfg  Configuration; copied, except for the strings it points to
+ * @param transport  Transport; copied
+ * @return The tunnel, or NULL if the token is invalid or memory runs out
+ */
 cft_tunnel_t *cft_tunnel_new(const cft_tunnel_config_t *cfg, const cft_transport_ops_t *transport);
 
-/* Runs the tunnel until cft_tunnel_request_stop() is called and the
- * connections have unregistered (or the stop timeout has passed). */
+/**
+ * @brief Runs the tunnel on the calling thread
+ *
+ * Returns after cft_tunnel_request_stop(), once the connections have
+ * unregistered or the stop timeout has passed.
+ */
 void cft_tunnel_run(cft_tunnel_t *tunnel);
 
-/* Thread-safe; cft_tunnel_run() returns soon after. */
+/**
+ * @brief Asks cft_tunnel_run() to stop; thread-safe
+ *
+ * @param tunnel  Tunnel
+ * @param stop_timeout_ms  How long to wait for the connections to unregister
+ */
 void cft_tunnel_request_stop(cft_tunnel_t *tunnel, uint32_t stop_timeout_ms);
 
+/**
+ * @brief Runs a function on the tunnel's thread; thread-safe
+ *
+ * Use it to answer requests or send WebSocket messages from other threads.
+ * The function runs within about 100 ms. A stream may close in the meantime:
+ * keep track of on_close.
+ *
+ * @return 0 on success, -1 if out of memory
+ */
+int cft_tunnel_post(cft_tunnel_t *tunnel, void (*fn)(void *arg), void *arg);
+
+/** @brief Frees a tunnel that is not running */
 void cft_tunnel_free(cft_tunnel_t *tunnel);
 
 #ifdef __cplusplus

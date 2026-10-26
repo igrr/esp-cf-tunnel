@@ -11,5 +11,5 @@ idf_component_register(
     INCLUDE_DIRS "include"
     PRIV_INCLUDE_DIRS "src"
     REQUIRES esp-tls
-    PRIV_REQUIRES esp_timer esp_hw_support
+    PRIV_REQUIRES esp_timer esp_hw_support pthread
 )

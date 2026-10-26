@@ -314,3 +314,76 @@ void cft_uuid_format(const uint8_t in[16], char out[37])
     snprintf(out, 37, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x", in[0], in[1], in[2],
              in[3], in[4], in[5], in[6], in[7], in[8], in[9], in[10], in[11], in[12], in[13], in[14], in[15]);
 }
+
+/* --- SHA-1 (RFC 3174) --- */
+
+static uint32_t rol32(uint32_t v, int n)
+{
+    return (v << n) | (v >> (32 - n));
+}
+
+static void sha1_block(uint32_t h[5], const uint8_t *p)
+{
+    uint32_t w[80];
+    for (int i = 0; i < 16; i++) {
+        w[i] = ((uint32_t)p[4 * i] << 24) | ((uint32_t)p[4 * i + 1] << 16) | ((uint32_t)p[4 * i + 2] << 8) | p[4 * i + 3];
+    }
+    for (int i = 16; i < 80; i++) {
+        w[i] = rol32(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+    }
+    uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
+    for (int i = 0; i < 80; i++) {
+        uint32_t f, k;
+        if (i < 20) {
+            f = (b & c) | (~b & d);
+            k = 0x5a827999;
+        } else if (i < 40) {
+            f = b ^ c ^ d;
+            k = 0x6ed9eba1;
+        } else if (i < 60) {
+            f = (b & c) | (b & d) | (c & d);
+            k = 0x8f1bbcdc;
+        } else {
+            f = b ^ c ^ d;
+            k = 0xca62c1d6;
+        }
+        uint32_t t = rol32(a, 5) + f + e + k + w[i];
+        e = d;
+        d = c;
+        c = rol32(b, 30);
+        b = a;
+        a = t;
+    }
+    h[0] += a;
+    h[1] += b;
+    h[2] += c;
+    h[3] += d;
+    h[4] += e;
+}
+
+void cft_sha1(const uint8_t *data, size_t len, uint8_t digest[20])
+{
+    uint32_t h[5] = {0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0};
+    size_t i = 0;
+    for (; i + 64 <= len; i += 64) {
+        sha1_block(h, data + i);
+    }
+    uint8_t tail[128] = {0};
+    size_t rem = len - i;
+    memcpy(tail, data + i, rem);
+    tail[rem] = 0x80;
+    size_t tail_len = rem + 1 + 8 <= 64 ? 64 : 128;
+    uint64_t bits = (uint64_t)len * 8;
+    for (int j = 0; j < 8; j++) {
+        tail[tail_len - 1 - j] = (uint8_t)(bits >> (8 * j));
+    }
+    for (size_t j = 0; j < tail_len; j += 64) {
+        sha1_block(h, tail + j);
+    }
+    for (int j = 0; j < 5; j++) {
+        digest[4 * j] = (uint8_t)(h[j] >> 24);
+        digest[4 * j + 1] = (uint8_t)(h[j] >> 16);
+        digest[4 * j + 2] = (uint8_t)(h[j] >> 8);
+        digest[4 * j + 3] = (uint8_t)h[j];
+    }
+}

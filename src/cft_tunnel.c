@@ -5,6 +5,7 @@
  * edge drains is replaced right away under a free index, so requests keep
  * flowing while the old connection finishes.
  */
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,7 +22,7 @@ static const char *TAG = "cft_tunnel";
 #define CONNECT_TIMEOUT_MS 15000
 #define BACKOFF_MIN_MS 1000
 #define BACKOFF_MAX_MS 60000
-#define POLL_MS 250
+#define POLL_MS 100 /* also the latency of cft_tunnel_post() */
 #define RX_BUF_SIZE 4096
 
 typedef enum {
@@ -50,6 +51,12 @@ typedef struct {
     size_t out_cap;
 } slot_t;
 
+typedef struct post {
+    struct post *next;
+    void (*fn)(void *arg);
+    void *arg;
+} post_t;
+
 struct cft_tunnel {
     cft_tunnel_config_t cfg;
     cft_transport_ops_t tr;
@@ -61,6 +68,9 @@ struct cft_tunnel {
     atomic_uint stop_timeout_ms;
     bool stopping;
     int64_t stop_deadline_ms;
+    pthread_mutex_t post_lock;
+    post_t *posts;      /* oldest first */
+    post_t **posts_tail;
 };
 
 /* Called by the connection; slot index = conn_index */
@@ -194,8 +204,8 @@ static bool slot_connected(cft_tunnel_t *t, int i)
         .version = t->cfg.version ? t->cfg.version : DEFAULT_VERSION,
         .arch = t->cfg.arch ? t->cfg.arch : "unknown",
         .num_previous_attempts = s->attempts,
-        .handler = t->cfg.handler,
-        .handler_arg = t->cfg.handler_arg,
+        .on_request = t->cfg.on_request,
+        .request_arg = t->cfg.request_arg,
         .on_event = on_conn_event,
         .event_arg = t,
         .max_request_body = t->cfg.max_request_body,
@@ -331,6 +341,8 @@ cft_tunnel_t *cft_tunnel_new(const cft_tunnel_config_t *cfg, const cft_transport
         free(t);
         return NULL;
     }
+    pthread_mutex_init(&t->post_lock, NULL);
+    t->posts_tail = &t->posts;
     atomic_init(&t->stop, false);
     atomic_init(&t->stop_timeout_ms, 5000);
     return t;
@@ -342,9 +354,41 @@ void cft_tunnel_request_stop(cft_tunnel_t *t, uint32_t stop_timeout_ms)
     atomic_store(&t->stop, true);
 }
 
+int cft_tunnel_post(cft_tunnel_t *t, void (*fn)(void *arg), void *arg)
+{
+    post_t *p = malloc(sizeof(*p));
+    if (!p) {
+        return -1;
+    }
+    p->next = NULL;
+    p->fn = fn;
+    p->arg = arg;
+    pthread_mutex_lock(&t->post_lock);
+    *t->posts_tail = p;
+    t->posts_tail = &p->next;
+    pthread_mutex_unlock(&t->post_lock);
+    return 0;
+}
+
+static void run_posts(cft_tunnel_t *t)
+{
+    pthread_mutex_lock(&t->post_lock);
+    post_t *p = t->posts;
+    t->posts = NULL;
+    t->posts_tail = &t->posts;
+    pthread_mutex_unlock(&t->post_lock);
+    while (p) {
+        post_t *next = p->next;
+        p->fn(p->arg);
+        free(p);
+        p = next;
+    }
+}
+
 void cft_tunnel_run(cft_tunnel_t *t)
 {
     for (;;) {
+        run_posts(t);
         int64_t now = cft_port_now_ms();
         if (atomic_load(&t->stop) && !t->stopping) {
             t->stopping = true;
@@ -461,6 +505,8 @@ void cft_tunnel_free(cft_tunnel_t *t)
     for (int i = 0; i < MAX_SLOTS; i++) {
         free(t->slots[i].out);
     }
+    run_posts(t); /* let posters free what they passed */
+    pthread_mutex_destroy(&t->post_lock);
     memset(&t->token, 0, sizeof(t->token));
     free(t->rx);
     free(t);

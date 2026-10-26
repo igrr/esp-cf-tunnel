@@ -103,3 +103,8 @@ esp_err_t cft_tunnel_stop(cft_tunnel_handle_t h, uint32_t timeout_ms)
     free(h);
     return ESP_OK;
 }
+
+cft_tunnel_t *cft_tunnel_get(cft_tunnel_handle_t h)
+{
+    return h ? h->tunnel : NULL;
+}

@@ -5,8 +5,9 @@ the HTTP requests that arrive on it, without cloudflared or a proxy host. It
 speaks cloudflared's HTTP/2 transport.
 
 Status: works against the production edge from a Linux host and from an
-ESP32-P4 over Ethernet. Not yet supported: WebSockets, streaming request or
-response bodies, a second (redundant) connection.
+ESP32-P4 over Ethernet: HTTP requests with streamed request and response
+bodies, WebSockets, and up to four redundant connections. Not supported:
+private network routing (WARP), the QUIC transport.
 
 ## Usage
 
@@ -17,22 +18,54 @@ request routed to the tunnel), and pass the tunnel token to the component:
 ```c
 #include "cf_tunnel_esp.h"
 
-static void handler(void *arg, const cft_request_t *req, cft_response_t *resp)
+static void on_request(void *arg, cft_stream_t *s, const cft_request_t *req)
 {
-    cft_response_add_header(resp, "Content-Type", "text/plain");
-    cft_response_set_body(resp, "hello\n", 6);
+    cft_stream_respond(s, 200, "text/plain", "hello\n", 6);
 }
 
 cft_tunnel_config_t cfg = {
     .token = tunnel_token,
-    .handler = handler,
+    .on_request = on_request,
 };
 cft_tunnel_handle_t tunnel;
 ESP_ERROR_CHECK(cft_tunnel_start(&cfg, &tunnel));
 ```
 
-The handler runs in the tunnel task once the full request has arrived.
-Request bodies over `max_request_body` (16 KiB by default) get 413.
+`on_request` runs in the tunnel task as soon as the request headers arrive.
+From there, a handler can:
+
+- respond at once: `cft_stream_respond()`;
+- collect the body first: `cft_stream_read_body(s, max_len, fn, ctx)`, which
+  answers 413 to bodies over the limit;
+- stream: set callbacks with `cft_stream_set_handlers()` (`on_body`,
+  `on_body_end`, `on_writable`, `on_close`) and send the response with
+  `cft_stream_send_headers()`, `cft_stream_write()` and `cft_stream_end()`.
+  `on_writable` fires once the queued data has been passed on, which is the
+  moment to write the next part of a large response;
+- accept a WebSocket (`req->is_websocket`): `cft_ws_accept()`, then
+  `on_ws_message` gets each message and `cft_ws_send()` sends. Fragmentation,
+  pings and the close handshake are handled by the component.
+
+```c
+static void ws_message(cft_stream_t *s, void *ctx, cft_ws_opcode_t op,
+                       const uint8_t *data, size_t len)
+{
+    cft_ws_send(s, op, data, len); /* echo */
+}
+
+    /* in on_request */
+    if (req->is_websocket) {
+        cft_stream_handlers_t h = {.on_ws_message = ws_message};
+        cft_stream_set_handlers(s, &h, NULL);
+        cft_ws_accept(s, NULL);
+    }
+```
+
+All stream functions must be called from the tunnel task. To respond or send
+WebSocket messages from another task, use `cft_tunnel_post()`, which runs a
+function in the tunnel task within about 100 ms. A stream is valid until its
+`on_close` callback. See [API.md](API.md) for the full API, and
+`examples/tunnel_ethernet` and `test_apps/host/main.c` for complete handlers.
 
 Connections: by default the tunnel keeps one connection to the edge
 (`num_connections`, up to 4, spread over both edge regions). When the edge
@@ -50,11 +83,12 @@ can be small: `CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN=y` with
 (`CONFIG_MBEDTLS_DYNAMIC_BUFFER` saves more, but IDF 5.x does not allow it
 together with TLS 1.3.)
 
-Measured on ESP32-P4 (internal RAM, no PSRAM; IDF v6.2-dev): the connected
-tunnel uses about 55 KB of heap when idle (including the 8 KB task stack) and
-about 90 KB at peak during a burst of 50 concurrent requests. The tunnel task
-used at most about 3 KB of its stack. Flash: 17 KB for this component and 79 KB
-for nghttp2.
+Measured on ESP32-P4 (internal RAM, no PSRAM; IDF v6.2-dev; asymmetric TLS
+buffers as above): one connected tunnel connection uses about 49 KB of heap
+when idle (including the 8 KB task stack) and about 71 KB at peak, during a
+WebSocket session followed by a burst of 50 concurrent requests. The tunnel
+task used at most about 3 KB of its stack. Flash: 23 KB for this component and
+79 KB for nghttp2.
 
 ## How it works
 
@@ -90,8 +124,9 @@ no I/O, `cft_tunnel.c` supervises the connections over a `cft_transport_ops_t`.
 ## Layout
 
 - `include/`, `src/`, `port/esp/`: the component
-- `examples/tunnel_ethernet/`: Ethernet example serving a status page
-  (pin defaults for the ESP32-P4 Function EV Board)
+- `examples/tunnel_ethernet/`: Ethernet example serving a status page with
+  live updates over a WebSocket (pin defaults for the ESP32-P4 Function EV
+  Board)
 - `test_apps/host/`: Linux runner (OpenSSL), RPC test and mock server
 - `tools/capnp_layout.py`: prints the Cap'n Proto struct layouts used in
   `src/cft_rpc.c`
@@ -122,8 +157,9 @@ cmake --build test_apps/host/build
 test_apps/host/build/cft_host --token-file tunnel.token
 ```
 
-Every request routed to the tunnel is answered by the demo handler in
-`test_apps/host/main.c`. Ctrl-C unregisters the connections. Options:
+Requests routed to the tunnel are answered by the demo endpoints in
+`test_apps/host/main.c` (`/echo`, `/upload`, `/big?size=N`, `/later`, `/ws`,
+and a page showing the request for anything else). Ctrl-C unregisters the connections. Options:
 `--connections N`, `--connector-id UUID`, `--edge HOST[:PORT]`, `--plain`
 (no TLS, for the fake edge), `--handler-delay-ms N`, `--max-streams N`, `-v`.
 
@@ -135,7 +171,9 @@ Every request routed to the tunnel is answered by the demo handler in
   Cap'n Proto implementation (pycapnp), with schemas in `test_apps/host/schemas`;
 - the host runner against `fake_edge.py`, which plays the edge's side of the
   protocol (HTTP/2 client, control stream, registration, configuration
-  pushes, drains, lost and unresponsive connections).
+  pushes, drains, lost and unresponsive connections), covering streamed
+  bodies and WebSockets too. The connector runs with AddressSanitizer and
+  UndefinedBehaviorSanitizer, and a leak check at exit.
 
 ```sh
 pip install pytest pycapnp h2

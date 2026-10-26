@@ -98,10 +98,15 @@ def connector(edge, token_file, tmp_path):
     yield start
     for p in procs:
         if p.poll() is None:
-            p.kill()
-            p.wait()
+            # A clean exit runs LeakSanitizer
+            p.send_signal(signal.SIGINT)
+            try:
+                p.wait(10)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
         log = Path(p.log_path).read_text()
-        assert "ERROR: AddressSanitizer" not in log and "runtime error" not in log, log
+        assert "Sanitizer" not in log and "runtime error" not in log, log
 
 
 def test_register_and_request(edge, connector):
@@ -116,7 +121,6 @@ def test_register_and_request(edge, connector):
     assert resp.status == 200
     assert b"GET /hello?x=1" in resp.body and b"x-test: abc" in resp.body
     assert resp.user_headers["content-type"].startswith("text/plain")
-    assert int(resp.user_headers["content-length"]) == len(resp.body)
     assert resp.headers["cf-cloudflared-response-meta"] == '{"src":"origin"}'
 
 
@@ -179,11 +183,22 @@ def test_graceful_stop(edge, connector):
         assert c.unregistered.is_set()
 
 
-def test_body_limit(edge, connector):
+def test_read_body(edge, connector):
     connector()
     [conn] = edge.wait_registered()
-    assert edge.request(conn, "POST", "/", body=b"x" * 10000).status == 200
-    assert edge.request(conn, "POST", "/", body=b"x" * 20000).status == 413
+    resp = edge.request(conn, "POST", "/upload", body=b"x" * 10000)
+    assert resp.status == 200 and resp.body == b"received 10000 bytes\n"
+    assert edge.request(conn, "POST", "/upload", body=b"x" * 20000).status == 413
+    # Refused from the header alone, before the body is sent
+
+    async def early():
+        sid = conn.open_stream("POST", "/upload", [("content-length", "100000")], end_stream=False)
+        await asyncio.wait_for(conn.streams[sid].headers_received.wait(), 5)
+        return conn.streams[sid].resp.status
+
+    assert edge.call(early()) == 413
+    resp = edge.request(conn, "GET", "/upload")
+    assert resp.body == b"received 0 bytes\n"
 
 
 def test_concurrency_limit(edge, connector):
@@ -202,3 +217,183 @@ def test_concurrency_limit(edge, connector):
 
     statuses = edge.call(burst())
     assert statuses.count(200) == 2 and statuses.count(503) == 3, statuses
+
+
+def test_streamed_response(edge, connector):
+    connector()
+    [conn] = edge.wait_registered()
+    resp = edge.request(conn, "GET", "/big?size=300000")
+    assert resp.status == 200
+    assert resp.headers["content-length"] == "300000"
+    assert resp.body == bytes(ord("a") + i % 26 for i in range(300000))
+
+
+def test_streamed_request_and_response(edge, connector):
+    connector()
+    [conn] = edge.wait_registered()
+
+    async def exchange():
+        sid = conn.open_stream("POST", "/echo", end_stream=False)
+        s = conn.streams[sid]
+        got = []
+        for i in range(3):
+            chunk = bytes([65 + i]) * 1000
+            conn.send_body(sid, chunk)
+            # Each chunk comes back before the next one is sent
+            data = b""
+            while len(data) < len(chunk):
+                data += await asyncio.wait_for(s.chunks.get(), 5)
+            got.append(data)
+        conn.send_body(sid, b"", end_stream=True)
+        await asyncio.wait_for(s.done.wait(), 5)
+        return s.resp.status, got
+
+    status, got = edge.call(exchange())
+    assert status == 200
+    assert got == [b"A" * 1000, b"B" * 1000, b"C" * 1000]
+
+
+def test_post_from_another_thread(edge, connector):
+    connector()
+    [conn] = edge.wait_registered()
+    t = time.monotonic()
+    resp = edge.request(conn, "GET", "/later")
+    assert resp.body == b"later\n" and time.monotonic() - t >= 0.2
+
+
+def test_streams_closed_with_connection(edge, connector):
+    """Open streams get on_close when the connection goes; LeakSanitizer checks the rest."""
+    connector()
+    [conn] = edge.wait_registered()
+    edge.call_soon(conn.open_stream, "GET", "/later")
+    edge.call_soon(conn.open_stream, "POST", "/echo", (), None, "x", False)
+    time.sleep(0.1)
+    edge.call_soon(conn.abort)
+    edge.wait_registered()
+
+
+# --- WebSocket ---
+
+def ws_frame(opcode, payload, fin=True, mask=b"\x01\x02\x03\x04"):
+    """Masked client frame"""
+    hdr = bytes([(0x80 if fin else 0) | opcode])
+    n = len(payload)
+    if n < 126:
+        hdr += bytes([0x80 | n])
+    elif n < 65536:
+        hdr += bytes([0x80 | 126]) + n.to_bytes(2, "big")
+    else:
+        hdr += bytes([0x80 | 127]) + n.to_bytes(8, "big")
+    return hdr + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+
+
+class WsReader:
+    """Parses unmasked server frames from a stream's data chunks"""
+
+    def __init__(self, stream):
+        self.stream = stream
+        self.buf = b""
+
+    async def frame(self):
+        while True:
+            if len(self.buf) >= 2:
+                n = self.buf[1] & 0x7f
+                pos = 2
+                if n == 126:
+                    n, pos = int.from_bytes(self.buf[2:4], "big"), 4
+                elif n == 127:
+                    n, pos = int.from_bytes(self.buf[2:10], "big"), 10
+                if len(self.buf) >= pos + n:
+                    op, payload = self.buf[0] & 0x0f, self.buf[pos:pos + n]
+                    self.buf = self.buf[pos + n:]
+                    return op, payload
+            self.buf += await asyncio.wait_for(self.stream.chunks.get(), 5)
+
+
+def ws_open(conn, path="/ws"):
+    key = base64.b64encode(os.urandom(16)).decode()
+    sid = conn.open_stream("GET", path, [("cf-cloudflared-proxy-connection-upgrade", "websocket"),
+                                         ("sec-websocket-key", key), ("sec-websocket-version", "13")],
+                           end_stream=False)
+    return sid, key
+
+
+def test_websocket_echo(edge, connector):
+    import hashlib
+    connector()
+    [conn] = edge.wait_registered()
+
+    async def session():
+        sid, key = ws_open(conn)
+        s = conn.streams[sid]
+        await asyncio.wait_for(s.headers_received.wait(), 5)
+        r = WsReader(s)
+        out = []
+        conn.send_body(sid, ws_frame(1, b"hello"))
+        out.append(await r.frame())
+        big = os.urandom(12000)  # under the 16 KiB default limit, in two fragments
+        conn.send_body(sid, ws_frame(2, big[:5000], fin=False) + ws_frame(0, big[5000:]))
+        out.append(await r.frame())
+        conn.send_body(sid, ws_frame(9, b"ping!"))
+        out.append(await r.frame())
+        conn.send_body(sid, ws_frame(1, b"close"))
+        out.append(await r.frame())
+        return s.resp, out, big, key
+
+    resp, frames, big, key = edge.call(session())
+    accept = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+    assert resp.status == 200
+    assert resp.user_headers["sec-websocket-accept"] == accept
+    assert resp.user_headers["upgrade"] == "websocket"
+    assert frames[0] == (1, b"hello")
+    assert frames[1] == (2, big)
+    assert frames[2] == (10, b"ping!")
+    assert frames[3] == (8, (1000).to_bytes(2, "big") + b"bye")
+
+
+def test_websocket_client_close(edge, connector):
+    connector()
+    [conn] = edge.wait_registered()
+
+    async def session():
+        sid, _ = ws_open(conn)
+        s = conn.streams[sid]
+        await asyncio.wait_for(s.headers_received.wait(), 5)
+        r = WsReader(s)
+        conn.send_body(sid, ws_frame(8, (1001).to_bytes(2, "big")))
+        return await r.frame()
+
+    assert edge.call(session()) == (8, (1001).to_bytes(2, "big"))
+
+
+def test_websocket_errors(edge, connector):
+    connector()
+    [conn] = edge.wait_registered()
+
+    async def session():
+        sid, _ = ws_open(conn)
+        s = conn.streams[sid]
+        await asyncio.wait_for(s.headers_received.wait(), 5)
+        r = WsReader(s)
+        # Unmasked frame from the client
+        conn.send_body(sid, b"\x81\x02hi")
+        return await r.frame()
+
+    op, payload = edge.call(session())
+    assert op == 8 and int.from_bytes(payload[:2], "big") == 1002
+
+
+def test_websocket_message_limit(edge, connector):
+    connector()
+    [conn] = edge.wait_registered()
+
+    async def session():
+        sid, _ = ws_open(conn)
+        s = conn.streams[sid]
+        await asyncio.wait_for(s.headers_received.wait(), 5)
+        r = WsReader(s)
+        conn.send_body(sid, ws_frame(2, b"x" * 20000))
+        return await r.frame()
+
+    op, payload = edge.call(session())
+    assert op == 8 and int.from_bytes(payload[:2], "big") == 1009

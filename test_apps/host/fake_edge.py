@@ -78,6 +78,7 @@ class EdgeConn:
         self.writer = writer
         self.h2 = h2.connection.H2Connection(h2.config.H2Configuration(client_side=True, header_encoding="utf-8"))
         self.streams = {}
+        self.pending = {}  # stream id -> [unsent data, end_stream]
         self.registration = None
         self.registered = asyncio.Event()
         self.unregistered = asyncio.Event()
@@ -169,6 +170,8 @@ class EdgeConn:
                 self.streams[ev.stream_id].resp.reset = ev.error_code
                 self.streams[ev.stream_id].headers_received.set()
                 self.streams[ev.stream_id].done.set()
+        elif isinstance(ev, h2.events.WindowUpdated):
+            self._send_pending()
         elif isinstance(ev, h2.events.ConnectionTerminated):
             self.writer.close()
 
@@ -186,12 +189,29 @@ class EdgeConn:
         return sid
 
     def send_body(self, sid, data, end_stream=False):
-        # Within the frame size; the tests stay within the flow control window
-        step = self.h2.max_outbound_frame_size
-        for i in range(0, len(data), step):
-            self.h2.send_data(sid, data[i:i + step], end_stream=end_stream and i + step >= len(data))
-        if not data and end_stream:
-            self.h2.end_stream(sid)
+        """Sends what flow control allows now; the rest follows as the window opens."""
+        self.pending.setdefault(sid, [b"", False])
+        self.pending[sid][0] += data
+        self.pending[sid][1] |= end_stream
+        self._send_pending()
+
+    def _send_pending(self):
+        for sid in list(self.pending):
+            data, end = self.pending[sid]
+            ended = False
+            while data:
+                n = min(len(data), self.h2.max_outbound_frame_size, self.h2.local_flow_control_window(sid))
+                if n <= 0:
+                    break
+                ended = end and n == len(data)
+                self.h2.send_data(sid, data[:n], end_stream=ended)
+                data = data[n:]
+            if data:
+                self.pending[sid][0] = data
+                continue
+            if end and not ended:
+                self.h2.end_stream(sid)
+            del self.pending[sid]
         self.flush()
 
     async def request(self, method, path, headers=(), body=None, authority="test.example.com"):

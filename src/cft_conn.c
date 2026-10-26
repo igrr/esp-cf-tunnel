@@ -16,13 +16,13 @@
 
 static const char *TAG = "cft_conn";
 
-/* Request headers set by the edge (cloudflared connection/http2.go). */
+/* Request headers set by the edge (cloudflared connection/http2.go) */
 #define HDR_UPGRADE "cf-cloudflared-proxy-connection-upgrade"
 #define HDR_TCP_SRC "cf-cloudflared-proxy-src"
 #define UPGRADE_CONTROL "control-stream"
 #define UPGRADE_CONFIG "update-configuration"
 #define UPGRADE_WEBSOCKET "websocket"
-/* Response headers read by the edge (cloudflared connection/header.go). */
+/* Response headers read by the edge (cloudflared connection/header.go) */
 #define HDR_RESP_USER_HEADERS "cf-cloudflared-response-headers"
 #define HDR_RESP_META "cf-cloudflared-response-meta"
 #define META_ORIGIN "{\"src\":\"origin\"}"
@@ -37,6 +37,7 @@ static const char *TAG = "cft_conn";
 #define CFT_PING_TIMEOUT_MS 10000
 #endif
 #define REGISTER_TIMEOUT_MS 15000
+#define DEFAULT_MAX_BODY (16 * 1024)
 
 static const char *const default_features[] = {
     "serialized_headers",
@@ -57,10 +58,30 @@ typedef enum {
     STREAM_UNSUPPORTED,
 } stream_kind_t;
 
-typedef struct stream {
-    struct stream *next; /* cft_conn.streams */
+/* Incoming WebSocket frame parser (RFC 6455) */
+typedef struct {
+    uint8_t hdr[14];
+    uint8_t hdr_len;
+    uint8_t hdr_need;    /* bytes of header expected; 0 = in payload */
+    uint8_t opcode;      /* of the current frame */
+    bool fin;
+    uint8_t mask[4];
+    uint64_t payload_left;
+    uint64_t payload_pos;
+    buf_t msg;           /* message being reassembled */
+    uint8_t msg_opcode;  /* 0 = no message in progress */
+    uint8_t ctrl[125];   /* payload of a control frame */
+    size_t ctrl_len;
+    bool close_sent;
+    bool failed;
+} ws_rx_t;
+
+struct cft_stream {
+    struct cft_stream *next; /* cft_conn.streams */
+    cft_conn_t *conn;
     int32_t id;
     stream_kind_t kind;
+    /* Request */
     char *method;
     char *path;
     char *authority;
@@ -68,28 +89,37 @@ typedef struct stream {
     cft_header_t *headers;
     size_t num_headers;
     size_t cap_headers;
-    buf_t body;
-    bool body_too_large;
+    cft_request_t req;
+    bool upgrade_ws; /* the edge marked it as a WebSocket request */
     bool counted;    /* included in cft_conn.num_requests */
-    bool overloaded; /* over the request limit: answered with 503 */
-    bool dispatched;
-    buf_t out;
-} stream_t;
-
-struct cft_response {
-    int status;
-    cft_header_t *headers;
-    size_t num_headers;
-    size_t cap_headers;
+    bool body_ended; /* END_STREAM received */
+    /* Application */
+    cft_stream_handlers_t h;
+    void *ctx;
+    /* cft_stream_read_body() and the configuration stream */
+    bool collect;
     buf_t body;
+    size_t body_max;
+    void (*body_fn)(cft_stream_t *s, void *ctx, const uint8_t *body, size_t len);
+    void *body_ctx;
+    /* Response */
+    bool resp_started;
+    bool resp_end; /* end after `out` drains */
+    bool resp_eof_sent;
+    bool deferred; /* data provider waits for cft_stream_write() */
+    bool want_writable;
+    buf_t out;
+    /* WebSocket */
+    bool ws;
+    ws_rx_t wsr;
 };
 
 struct cft_conn {
     cft_conn_config_t cfg;
     nghttp2_session *h2;
     cft_rpc_t *rpc;
-    stream_t *control;
-    stream_t *streams; /* all open streams; nghttp2_session_del does not report closes */
+    cft_stream_t *control;
+    cft_stream_t *streams; /* all open streams; nghttp2_session_del does not report closes */
     uint32_t num_requests; /* open STREAM_HTTP streams */
     uint8_t client_id[16];
     int32_t config_version;
@@ -115,6 +145,9 @@ struct cft_conn {
 
 static int buf_append(buf_t *b, const void *data, size_t len)
 {
+    if (len == 0) {
+        return 0;
+    }
     if (b->len + len > b->cap) {
         size_t cap = b->cap ? b->cap : 256;
         while (cap < b->len + len) {
@@ -167,15 +200,6 @@ static int headers_append(cft_header_t **arr, size_t *n, size_t *cap, const char
     return 0;
 }
 
-static void headers_free(cft_header_t *arr, size_t n)
-{
-    for (size_t i = 0; i < n; i++) {
-        free((char *)arr[i].name);
-        free((char *)arr[i].value);
-    }
-    free(arr);
-}
-
 static char *dupn(const uint8_t *s, size_t n)
 {
     char *d = malloc(n + 1);
@@ -186,35 +210,31 @@ static char *dupn(const uint8_t *s, size_t n)
     return d;
 }
 
-static void stream_free(stream_t *s)
+static void stream_free(cft_stream_t *s)
 {
     free(s->method);
     free(s->path);
     free(s->authority);
     free(s->scheme);
-    headers_free(s->headers, s->num_headers);
+    for (size_t i = 0; i < s->num_headers; i++) {
+        free((char *)s->headers[i].name);
+        free((char *)s->headers[i].value);
+    }
+    free(s->headers);
     buf_free(&s->body);
     buf_free(&s->out);
+    buf_free(&s->wsr.msg);
     free(s);
 }
 
-/* --- response API --- */
-
-void cft_response_set_status(cft_response_t *resp, int status)
+static void stream_unlink(cft_conn_t *c, cft_stream_t *s)
 {
-    resp->status = status;
-}
-
-int cft_response_add_header(cft_response_t *resp, const char *name, const char *value)
-{
-    return headers_append(&resp->headers, &resp->num_headers, &resp->cap_headers, name, strlen(name), value,
-                          strlen(value));
-}
-
-int cft_response_set_body(cft_response_t *resp, const void *data, size_t len)
-{
-    resp->body.len = 0;
-    return buf_append(&resp->body, data, len);
+    for (cft_stream_t **pp = &c->streams; *pp; pp = &(*pp)->next) {
+        if (*pp == s) {
+            *pp = s->next;
+            return;
+        }
+    }
 }
 
 /* --- events --- */
@@ -241,22 +261,21 @@ static void conn_fail(cft_conn_t *c, const char *reason)
     emit(c, &ev);
 }
 
-/* --- submitting responses --- */
+/* --- response data --- */
 
-static nghttp2_ssize read_out_buf(nghttp2_session *session, int32_t stream_id, uint8_t *buf, size_t length,
-                                  uint32_t *data_flags, nghttp2_data_source *source, void *user_data)
+static nghttp2_ssize read_out(nghttp2_session *session, int32_t stream_id, uint8_t *buf, size_t length,
+                              uint32_t *data_flags, nghttp2_data_source *source, void *user_data)
 {
-    (void)session;
-    (void)stream_id;
-    (void)user_data;
-    stream_t *s = source->ptr;
+    cft_stream_t *s = source->ptr;
     size_t avail = s->out.len - s->out.off;
     if (avail == 0) {
-        if (s->kind == STREAM_CONTROL) {
-            return NGHTTP2_ERR_DEFERRED;
+        if (s->resp_end) {
+            *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+            s->resp_eof_sent = true;
+            return 0;
         }
-        *data_flags |= NGHTTP2_DATA_FLAG_EOF;
-        return 0;
+        s->deferred = true;
+        return NGHTTP2_ERR_DEFERRED;
     }
     size_t n = avail < length ? avail : length;
     memcpy(buf, s->out.p + s->out.off, n);
@@ -264,11 +283,22 @@ static nghttp2_ssize read_out_buf(nghttp2_session *session, int32_t stream_id, u
     if (s->out.off == s->out.len) {
         s->out.off = 0;
         s->out.len = 0;
-        if (s->kind != STREAM_CONTROL) {
+        if (s->resp_end) {
             *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+            s->resp_eof_sent = true;
+        } else if (s->kind == STREAM_HTTP) {
+            s->want_writable = true;
         }
     }
     return (nghttp2_ssize)n;
+}
+
+static void resume(cft_stream_t *s)
+{
+    if (s->deferred) {
+        s->deferred = false;
+        nghttp2_session_resume_data(s->conn->h2, s->id);
+    }
 }
 
 #define NV(n, v) {(uint8_t *)(n), (uint8_t *)(v), strlen(n), strlen(v), NGHTTP2_NV_FLAG_NONE}
@@ -301,56 +331,350 @@ static char *serialize_headers(const cft_header_t *h, size_t n)
     return out;
 }
 
-/* Sends status + headers; the body is whatever is in s->out. */
-static int submit_response(cft_conn_t *c, stream_t *s, int status, const cft_header_t *user_headers,
-                           size_t num_user_headers, const char *meta)
+/*
+ * Response headers as cloudflared sends them: user headers serialized in one
+ * header (so HTTP/2 header rules don't apply to them), content-length also
+ * as an HTTP/2 header, and the meta header naming the source.
+ */
+static int submit_headers(cft_stream_t *s, int status, const cft_header_t *headers, size_t num_headers,
+                          const char *meta)
 {
-    char status_str[8];
-    char clen[24];
-    snprintf(status_str, sizeof(status_str), "%d", status);
-    snprintf(clen, sizeof(clen), "%zu", s->out.len);
-
-    /* Content-Length is meaningful to the edge, so it is sent both as an
-     * HTTP/2 header and among the serialized user headers. */
-    cft_header_t *uh = malloc((num_user_headers + 1) * sizeof(*uh));
-    if (!uh) {
+    if (s->resp_started) {
         return -1;
     }
-    size_t nuh = 0;
-    bool have_clen = false;
-    for (size_t i = 0; i < num_user_headers; i++) {
-        if (strcasecmp(user_headers[i].name, "content-length") == 0) {
-            have_clen = true;
-        }
-        uh[nuh++] = user_headers[i];
-    }
-    if (!have_clen) {
-        uh[nuh].name = "Content-Length";
-        uh[nuh].value = clen;
-        nuh++;
-    }
-    char *serialized = serialize_headers(uh, nuh);
-    free(uh);
+    char status_str[8];
+    snprintf(status_str, sizeof(status_str), "%d", status == 101 ? 200 : status); /* HTTP/2 has no 101 */
+    char *serialized = serialize_headers(headers, num_headers);
     if (!serialized) {
         return -1;
     }
-
-    nghttp2_nv nva[] = {
-        NV(":status", status_str),
-        NV("content-length", clen),
-        NV(HDR_RESP_USER_HEADERS, serialized),
-        NV(HDR_RESP_META, meta),
-    };
-    nghttp2_data_provider2 prd = {.source.ptr = s, .read_callback = read_out_buf};
-    int rv = nghttp2_submit_response2(c->h2, s->id, nva, sizeof(nva) / sizeof(nva[0]), &prd);
+    nghttp2_nv nva[4] = {NV(":status", status_str), NV(HDR_RESP_USER_HEADERS, serialized), NV(HDR_RESP_META, meta)};
+    size_t nnv = 3;
+    for (size_t i = 0; i < num_headers; i++) {
+        if (strcasecmp(headers[i].name, "content-length") == 0) {
+            nva[nnv++] = (nghttp2_nv)NV("content-length", headers[i].value);
+            break;
+        }
+    }
+    nghttp2_data_provider2 prd = {.source.ptr = s, .read_callback = read_out};
+    int rv = nghttp2_submit_response2(s->conn->h2, s->id, nva, nnv, &prd);
     free(serialized);
-    return rv;
+    if (rv != 0) {
+        return -1;
+    }
+    s->resp_started = true;
+    return 0;
 }
 
-static int submit_simple(cft_conn_t *c, stream_t *s, int status, const char *meta)
+static int respond_full(cft_stream_t *s, int status, const char *content_type, const void *body, size_t len,
+                        const char *meta)
 {
-    s->out.len = 0;
-    return submit_response(c, s, status, NULL, 0, meta);
+    char clen[24];
+    snprintf(clen, sizeof(clen), "%zu", len);
+    cft_header_t hdrs[2] = {{"Content-Length", clen}, {"Content-Type", content_type}};
+    if (submit_headers(s, status, hdrs, content_type ? 2 : 1, meta) < 0) {
+        return -1;
+    }
+    if (buf_append(&s->out, body, len) < 0) {
+        return -1;
+    }
+    s->resp_end = true;
+    resume(s);
+    return 0;
+}
+
+/* --- public stream API --- */
+
+const cft_request_t *cft_stream_request(const cft_stream_t *s)
+{
+    return &s->req;
+}
+
+const char *cft_stream_header(const cft_stream_t *s, const char *name)
+{
+    for (size_t i = 0; i < s->num_headers; i++) {
+        if (strcmp(s->headers[i].name, name) == 0) {
+            return s->headers[i].value;
+        }
+    }
+    return NULL;
+}
+
+void cft_stream_set_handlers(cft_stream_t *s, const cft_stream_handlers_t *handlers, void *ctx)
+{
+    s->h = *handlers;
+    s->ctx = ctx;
+}
+
+int cft_stream_read_body(cft_stream_t *s, size_t max_len,
+                         void (*fn)(cft_stream_t *s, void *ctx, const uint8_t *body, size_t len), void *ctx)
+{
+    s->collect = true;
+    s->body_max = max_len ? max_len : s->conn->cfg.max_request_body ? s->conn->cfg.max_request_body
+                  : DEFAULT_MAX_BODY;
+    s->body_fn = fn;
+    s->body_ctx = ctx;
+    if (s->req.content_length > (int64_t)s->body_max) {
+        s->body_fn = NULL;
+        return respond_full(s, 413, NULL, NULL, 0, META_ORIGIN);
+    }
+    return 0;
+}
+
+int cft_stream_send_headers(cft_stream_t *s, int status, const cft_header_t *headers, size_t num_headers)
+{
+    return submit_headers(s, status, headers, num_headers, META_ORIGIN);
+}
+
+int cft_stream_write(cft_stream_t *s, const void *data, size_t len)
+{
+    if (!s->resp_started || s->resp_end) {
+        return -1;
+    }
+    if (buf_append(&s->out, data, len) < 0) {
+        return -1;
+    }
+    resume(s);
+    return 0;
+}
+
+int cft_stream_end(cft_stream_t *s)
+{
+    if (!s->resp_started || s->resp_end) {
+        return -1;
+    }
+    s->resp_end = true;
+    resume(s);
+    return 0;
+}
+
+size_t cft_stream_buffered(const cft_stream_t *s)
+{
+    return s->out.len - s->out.off;
+}
+
+int cft_stream_respond(cft_stream_t *s, int status, const char *content_type, const void *body, size_t len)
+{
+    return respond_full(s, status, content_type, body, len, META_ORIGIN);
+}
+
+void cft_stream_reset(cft_stream_t *s)
+{
+    nghttp2_submit_rst_stream(s->conn->h2, NGHTTP2_FLAG_NONE, s->id, NGHTTP2_CANCEL);
+}
+
+/* --- WebSocket --- */
+
+static int ws_send_frame(cft_stream_t *s, uint8_t opcode, const void *data, size_t len)
+{
+    uint8_t hdr[10];
+    size_t hl;
+    hdr[0] = 0x80 | opcode; /* FIN */
+    if (len < 126) {
+        hdr[1] = (uint8_t)len;
+        hl = 2;
+    } else if (len <= 0xffff) {
+        hdr[1] = 126;
+        hdr[2] = (uint8_t)(len >> 8);
+        hdr[3] = (uint8_t)len;
+        hl = 4;
+    } else {
+        hdr[1] = 127;
+        for (int i = 0; i < 8; i++) {
+            hdr[2 + i] = (uint8_t)((uint64_t)len >> (56 - 8 * i));
+        }
+        hl = 10;
+    }
+    if (buf_append(&s->out, hdr, hl) < 0 || buf_append(&s->out, data, len) < 0) {
+        return -1;
+    }
+    resume(s);
+    return 0;
+}
+
+int cft_ws_accept(cft_stream_t *s, const char *subprotocol)
+{
+    const char *key = cft_stream_header(s, "sec-websocket-key");
+    if (!s->req.is_websocket || !key || s->resp_started) {
+        return -1;
+    }
+    static const char guid[] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    char buf[128];
+    int n = snprintf(buf, sizeof(buf), "%s%s", key, guid);
+    if (n < 0 || n >= (int)sizeof(buf)) {
+        return -1;
+    }
+    uint8_t digest[20];
+    cft_sha1((const uint8_t *)buf, (size_t)n, digest);
+    char accept[29];
+    cft_b64_encode_raw(digest, 20, accept);
+    accept[27] = '=';
+    accept[28] = '\0';
+    cft_header_t hdrs[4] = {
+        {"Upgrade", "websocket"},
+        {"Connection", "Upgrade"},
+        {"Sec-WebSocket-Accept", accept},
+        {"Sec-WebSocket-Protocol", subprotocol},
+    };
+    if (submit_headers(s, 101, hdrs, subprotocol ? 4 : 3, META_ORIGIN) < 0) {
+        return -1;
+    }
+    s->ws = true;
+    return 0;
+}
+
+int cft_ws_send(cft_stream_t *s, cft_ws_opcode_t opcode, const void *data, size_t len)
+{
+    if (!s->ws || s->wsr.close_sent || s->resp_end) {
+        return -1;
+    }
+    return ws_send_frame(s, (uint8_t)opcode, data, len);
+}
+
+int cft_ws_close(cft_stream_t *s, uint16_t code, const char *reason)
+{
+    if (!s->ws || s->wsr.close_sent) {
+        return -1;
+    }
+    uint8_t payload[125];
+    size_t rl = reason ? strlen(reason) : 0;
+    if (rl > sizeof(payload) - 2) {
+        rl = sizeof(payload) - 2;
+    }
+    payload[0] = (uint8_t)(code >> 8);
+    payload[1] = (uint8_t)code;
+    if (rl) {
+        memcpy(payload + 2, reason, rl);
+    }
+    s->wsr.close_sent = true;
+    if (ws_send_frame(s, CFT_WS_CLOSE, payload, rl + 2) < 0) {
+        return -1;
+    }
+    return cft_stream_end(s);
+}
+
+static void ws_fail(cft_stream_t *s, uint16_t code, const char *why)
+{
+    CFT_LOGW(TAG, "stream %d: WebSocket error: %s", (int)s->id, why);
+    s->wsr.failed = true;
+    cft_ws_close(s, code, why);
+}
+
+static void ws_frame_done(cft_stream_t *s)
+{
+    ws_rx_t *w = &s->wsr;
+    switch (w->opcode) {
+    case CFT_WS_PING:
+        if (!w->close_sent) {
+            ws_send_frame(s, CFT_WS_PONG, w->ctrl, w->ctrl_len);
+        }
+        break;
+    case CFT_WS_PONG:
+        break;
+    case CFT_WS_CLOSE:
+        if (!w->close_sent) {
+            uint16_t code = w->ctrl_len >= 2 ? (uint16_t)((w->ctrl[0] << 8) | w->ctrl[1]) : 1000;
+            cft_ws_close(s, code, NULL);
+        }
+        break;
+    default:
+        if (w->fin && s->h.on_ws_message) {
+            s->h.on_ws_message(s, s->ctx, (cft_ws_opcode_t)w->msg_opcode, w->msg.p, w->msg.len);
+        }
+        if (w->fin) {
+            w->msg.len = 0;
+            w->msg_opcode = 0;
+        }
+        break;
+    }
+}
+
+static void ws_feed(cft_stream_t *s, const uint8_t *data, size_t len)
+{
+    ws_rx_t *w = &s->wsr;
+    size_t max = s->conn->cfg.max_request_body ? s->conn->cfg.max_request_body : DEFAULT_MAX_BODY;
+    while (len && !w->failed) {
+        if (w->hdr_need == 0 && w->payload_left == 0 && w->hdr_len == 0) {
+            w->hdr_need = 2;
+        }
+        if (w->hdr_need) {
+            w->hdr[w->hdr_len++] = *data++;
+            len--;
+            if (w->hdr_len == 2) {
+                uint8_t l7 = w->hdr[1] & 0x7f;
+                w->hdr_need = (uint8_t)(2 + (l7 == 126 ? 2 : l7 == 127 ? 8 : 0) + ((w->hdr[1] & 0x80) ? 4 : 0));
+            }
+            if (w->hdr_len < w->hdr_need) {
+                continue;
+            }
+            /* Header complete */
+            w->fin = w->hdr[0] & 0x80;
+            w->opcode = w->hdr[0] & 0x0f;
+            uint8_t l7 = w->hdr[1] & 0x7f;
+            size_t pos = 2;
+            uint64_t plen = l7;
+            if (l7 == 126) {
+                plen = ((uint64_t)w->hdr[2] << 8) | w->hdr[3];
+                pos = 4;
+            } else if (l7 == 127) {
+                plen = 0;
+                for (int i = 0; i < 8; i++) {
+                    plen = (plen << 8) | w->hdr[2 + i];
+                }
+                pos = 10;
+            }
+            w->hdr_need = 0;
+            w->hdr_len = 0;
+            if (!(w->hdr[1] & 0x80)) {
+                ws_fail(s, 1002, "unmasked frame from client");
+                return;
+            }
+            memcpy(w->mask, w->hdr + pos, 4);
+            bool control = w->opcode & 0x08;
+            if (control && (plen > 125 || !w->fin)) {
+                ws_fail(s, 1002, "invalid control frame");
+                return;
+            }
+            if (!control) {
+                if ((w->opcode == 0) != (w->msg_opcode != 0)) {
+                    ws_fail(s, 1002, "unexpected continuation");
+                    return;
+                }
+                if (w->opcode) {
+                    w->msg_opcode = w->opcode;
+                }
+                if (w->msg.len + plen > max) {
+                    ws_fail(s, 1009, "message too big");
+                    return;
+                }
+            }
+            w->payload_left = plen;
+            w->payload_pos = 0;
+            w->ctrl_len = 0;
+            if (plen == 0) {
+                ws_frame_done(s);
+            }
+            continue;
+        }
+        /* Payload */
+        size_t k = len < w->payload_left ? len : (size_t)w->payload_left;
+        for (size_t i = 0; i < k; i++) {
+            uint8_t b = data[i] ^ w->mask[(w->payload_pos + i) & 3];
+            if (w->opcode & 0x08) {
+                w->ctrl[w->ctrl_len++] = b;
+            } else if (buf_append(&w->msg, &b, 1) < 0) {
+                ws_fail(s, 1011, "out of memory");
+                return;
+            }
+        }
+        data += k;
+        len -= k;
+        w->payload_pos += k;
+        w->payload_left -= k;
+        if (w->payload_left == 0) {
+            ws_frame_done(s);
+        }
+    }
 }
 
 /* --- control stream / RPC --- */
@@ -361,7 +685,7 @@ static int rpc_send(void *arg, const uint8_t *data, size_t len)
     if (!c->control || buf_append(&c->control->out, data, len) < 0) {
         return -1;
     }
-    nghttp2_session_resume_data(c->h2, c->control->id);
+    resume(c->control);
     return 0;
 }
 
@@ -401,7 +725,7 @@ static void rpc_event(void *arg, const cft_rpc_event_t *rev)
     }
 }
 
-static void start_control_stream(cft_conn_t *c, stream_t *s)
+static void start_control_stream(cft_conn_t *c, cft_stream_t *s)
 {
     if (c->control) {
         CFT_LOGW(TAG, "second control stream %d refused", (int)s->id);
@@ -433,15 +757,16 @@ static void start_control_stream(cft_conn_t *c, stream_t *s)
     /* Plain 200 without the response meta headers, as cloudflared's
      * ResponseWriter does on its first Write. */
     nghttp2_nv nva[] = {NV(":status", "200")};
-    nghttp2_data_provider2 prd = {.source.ptr = s, .read_callback = read_out_buf};
+    nghttp2_data_provider2 prd = {.source.ptr = s, .read_callback = read_out};
     if (nghttp2_submit_response2(c->h2, s->id, nva, 1, &prd) != 0 || cft_rpc_start(c->rpc) < 0) {
         conn_fail(c, "failed to start control stream");
     }
+    s->resp_started = true;
 }
 
 /* --- request dispatch --- */
 
-static void handle_config(cft_conn_t *c, stream_t *s)
+static void handle_config(cft_conn_t *c, cft_stream_t *s)
 {
     /* Body: {"version": N, "config": {...}}; reply with the version we now
      * have (cloudflared orchestration.UpdateConfig). */
@@ -464,69 +789,85 @@ static void handle_config(cft_conn_t *c, stream_t *s)
     char reply[96];
     int n = snprintf(reply, sizeof(reply), "{\"lastAppliedVersion\":%ld,\"err\":%s}", (long)c->config_version,
                      ok ? "null" : "\"malformed configuration\"");
-    s->out.len = 0;
-    buf_append(&s->out, reply, (size_t)n);
+    /* Plain response, as cloudflared's ResponseWriter writes it */
     nghttp2_nv nva[] = {NV(":status", "200"), NV("content-type", "application/json")};
-    nghttp2_data_provider2 prd = {.source.ptr = s, .read_callback = read_out_buf};
+    buf_append(&s->out, reply, (size_t)n);
+    s->resp_end = true;
+    s->resp_started = true;
+    nghttp2_data_provider2 prd = {.source.ptr = s, .read_callback = read_out};
     nghttp2_submit_response2(c->h2, s->id, nva, 2, &prd);
 }
 
-static void handle_http(cft_conn_t *c, stream_t *s)
+static void build_request(cft_stream_t *s)
 {
-    if (s->overloaded) {
-        CFT_LOGW(TAG, "too many concurrent requests, answering 503");
-        submit_simple(c, s, 503, META_ORIGIN);
-        return;
-    }
-    if (s->body_too_large) {
-        submit_simple(c, s, 413, META_ORIGIN);
-        return;
-    }
-    cft_request_t req = {
+    s->req = (cft_request_t) {
         .method = s->method ? s->method : "",
         .path = s->path ? s->path : "/",
         .authority = s->authority ? s->authority : "",
         .scheme = s->scheme ? s->scheme : "https",
         .headers = s->headers,
         .num_headers = s->num_headers,
-        .body = s->body.p,
-        .body_len = s->body.len,
+        .content_length = -1,
+        .is_websocket = s->upgrade_ws,
     };
-    cft_response_t resp = {.status = 200};
-    if (c->cfg.handler) {
-        c->cfg.handler(c->cfg.handler_arg, &req, &resp);
-    } else {
-        resp.status = 404;
+    const char *cl = cft_stream_header(s, "content-length");
+    if (cl) {
+        s->req.content_length = strtoll(cl, NULL, 10);
     }
-    buf_free(&s->out);
-    s->out = resp.body; /* take ownership */
-    s->out.off = 0;
-    if (submit_response(c, s, resp.status, resp.headers, resp.num_headers, META_ORIGIN) != 0) {
-        nghttp2_submit_rst_stream(c->h2, NGHTTP2_FLAG_NONE, s->id, NGHTTP2_INTERNAL_ERROR);
-    }
-    headers_free(resp.headers, resp.num_headers);
 }
 
-static void dispatch(cft_conn_t *c, stream_t *s)
+/* Headers complete (END_HEADERS) */
+static void on_request_headers(cft_conn_t *c, cft_stream_t *s)
 {
-    if (s->dispatched) {
+    switch (s->kind) {
+    case STREAM_CONTROL:
+        start_control_stream(c, s);
+        return;
+    case STREAM_CONFIG:
+        s->collect = true;
+        s->body_max = 64 * 1024;
+        return;
+    case STREAM_UNSUPPORTED:
+        respond_full(s, 502, NULL, NULL, 0, META_CLOUDFLARED);
+        return;
+    case STREAM_HTTP:
+        break;
+    }
+    build_request(s);
+    CFT_LOGI(TAG, "%s %s%s%s", s->req.method, s->req.authority, s->req.path, s->req.is_websocket ? " (WebSocket)" : "");
+    uint32_t limit = c->cfg.max_concurrent_streams ? c->cfg.max_concurrent_streams : 16;
+    s->counted = true;
+    if (++c->num_requests > limit) {
+        CFT_LOGW(TAG, "too many concurrent requests, answering 503");
+        respond_full(s, 503, NULL, NULL, 0, META_ORIGIN);
         return;
     }
-    s->dispatched = true;
-    switch (s->kind) {
-    case STREAM_CONFIG:
+    if (c->cfg.on_request) {
+        c->cfg.on_request(c->cfg.request_arg, s, &s->req);
+    } else {
+        respond_full(s, 404, NULL, NULL, 0, META_ORIGIN);
+    }
+}
+
+/* END_STREAM received */
+static void on_request_end(cft_conn_t *c, cft_stream_t *s)
+{
+    s->body_ended = true;
+    if (s->kind == STREAM_CONFIG) {
         handle_config(c, s);
-        break;
-    case STREAM_HTTP:
-        CFT_LOGI(TAG, "%s %s%s", s->method ? s->method : "?", s->authority ? s->authority : "",
-                 s->path ? s->path : "");
-        handle_http(c, s);
-        break;
-    case STREAM_UNSUPPORTED:
-        submit_simple(c, s, 502, META_CLOUDFLARED);
-        break;
-    case STREAM_CONTROL:
-        break;
+        return;
+    }
+    if (s->kind != STREAM_HTTP || s->resp_end) {
+        return;
+    }
+    if (s->collect) {
+        if (s->body_fn) {
+            s->body_fn(s, s->body_ctx, s->body.p, s->body.len);
+        }
+        return;
+    }
+    if (s->h.on_body_end) {
+        s->h.on_body_end(s, s->ctx);
     }
 }
 
@@ -537,11 +878,12 @@ static int on_begin_headers(nghttp2_session *session, const nghttp2_frame *frame
     if (frame->hd.type != NGHTTP2_HEADERS || frame->headers.cat != NGHTTP2_HCAT_REQUEST) {
         return 0;
     }
-    stream_t *s = calloc(1, sizeof(*s));
+    cft_stream_t *s = calloc(1, sizeof(*s));
     if (!s) {
         return NGHTTP2_ERR_CALLBACK_FAILURE;
     }
     cft_conn_t *c = user_data;
+    s->conn = c;
     s->id = frame->hd.stream_id;
     s->kind = STREAM_HTTP;
     s->next = c->streams;
@@ -558,9 +900,7 @@ static bool eq(const uint8_t *a, size_t alen, const char *b)
 static int on_header(nghttp2_session *session, const nghttp2_frame *frame, const uint8_t *name, size_t namelen,
                      const uint8_t *value, size_t valuelen, uint8_t flags, void *user_data)
 {
-    (void)flags;
-    (void)user_data;
-    stream_t *s = nghttp2_session_get_stream_user_data(session, frame->hd.stream_id);
+    cft_stream_t *s = nghttp2_session_get_stream_user_data(session, frame->hd.stream_id);
     if (!s || frame->hd.type != NGHTTP2_HEADERS || frame->headers.cat != NGHTTP2_HCAT_REQUEST) {
         return 0;
     }
@@ -584,14 +924,15 @@ static int on_header(nghttp2_session *session, const nghttp2_frame *frame, const
             s->kind = STREAM_CONTROL;
         } else if (eq(value, valuelen, UPGRADE_CONFIG)) {
             s->kind = STREAM_CONFIG;
+        } else if (eq(value, valuelen, UPGRADE_WEBSOCKET)) {
+            s->upgrade_ws = true;
         } else {
-            /* websocket: not supported yet */
             s->kind = STREAM_UNSUPPORTED;
         }
         return 0;
     }
     if (eq(name, namelen, HDR_TCP_SRC)) {
-        s->kind = STREAM_UNSUPPORTED;
+        s->kind = STREAM_UNSUPPORTED; /* WARP routing to private networks */
         return 0;
     }
     if (headers_append(&s->headers, &s->num_headers, &s->cap_headers, (const char *)name, namelen,
@@ -604,41 +945,28 @@ static int on_header(nghttp2_session *session, const nghttp2_frame *frame, const
 static int on_frame_recv(nghttp2_session *session, const nghttp2_frame *frame, void *user_data)
 {
     cft_conn_t *c = user_data;
-    stream_t *s = nghttp2_session_get_stream_user_data(session, frame->hd.stream_id);
+    cft_stream_t *s = nghttp2_session_get_stream_user_data(session, frame->hd.stream_id);
     switch (frame->hd.type) {
     case NGHTTP2_HEADERS:
         if (!s || frame->headers.cat != NGHTTP2_HCAT_REQUEST) {
             break;
         }
-        CFT_LOGD(TAG, "stream %d: kind %d %s %s%s", (int)s->id, s->kind, s->method ? s->method : "",
-                 s->authority ? s->authority : "", s->path ? s->path : "");
-        if (s->kind == STREAM_CONTROL) {
-            start_control_stream(c, s);
-            break;
-        }
-        if (s->kind == STREAM_HTTP) {
-            uint32_t limit = c->cfg.max_concurrent_streams ? c->cfg.max_concurrent_streams : 16;
-            s->counted = true;
-            if (++c->num_requests > limit) {
-                s->overloaded = true;
-            }
-        }
+        on_request_headers(c, s);
         if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
-            dispatch(c, s);
+            on_request_end(c, s);
         }
         break;
     case NGHTTP2_DATA:
         if (s && s->kind != STREAM_CONTROL && (frame->hd.flags & NGHTTP2_FLAG_END_STREAM)) {
-            dispatch(c, s);
+            on_request_end(c, s);
         }
         break;
     case NGHTTP2_RST_STREAM:
-        CFT_LOGD(TAG, "edge reset stream %d (error %u)", (int)frame->hd.stream_id, (unsigned)frame->rst_stream.error_code);
+        CFT_LOGD(TAG, "edge reset stream %d (error %u)", (int)frame->hd.stream_id,
+                 (unsigned)frame->rst_stream.error_code);
         break;
     case NGHTTP2_GOAWAY:
-        CFT_LOGI(TAG, "edge sent GOAWAY (error %u%s%.*s)", (unsigned)frame->goaway.error_code,
-                 frame->goaway.opaque_data_len ? ": " : "", (int)frame->goaway.opaque_data_len,
-                 frame->goaway.opaque_data);
+        CFT_LOGI(TAG, "edge sent GOAWAY (error %u)", (unsigned)frame->goaway.error_code);
         if (!c->shutting_down) {
             /* Edge is draining this connection (e.g. maintenance). Let the
              * supervisor open a replacement, and unregister this one. */
@@ -661,9 +989,8 @@ static int on_frame_recv(nghttp2_session *session, const nghttp2_frame *frame, v
 static int on_data_chunk(nghttp2_session *session, uint8_t flags, int32_t stream_id, const uint8_t *data, size_t len,
                          void *user_data)
 {
-    (void)flags;
     cft_conn_t *c = user_data;
-    stream_t *s = nghttp2_session_get_stream_user_data(session, stream_id);
+    cft_stream_t *s = nghttp2_session_get_stream_user_data(session, stream_id);
     if (!s) {
         return 0;
     }
@@ -673,48 +1000,57 @@ static int on_data_chunk(nghttp2_session *session, uint8_t flags, int32_t stream
         }
         return 0;
     }
-    size_t limit = c->cfg.max_request_body ? c->cfg.max_request_body : 16 * 1024;
-    if (s->overloaded || s->body_too_large || s->body.len + len > limit) {
-        s->body_too_large = true;
-        return 0;
+    if (s->resp_end && !s->ws) {
+        return 0; /* already answered (413, 503, ...) */
     }
-    if (buf_append(&s->body, data, len) < 0) {
-        s->body_too_large = true;
+    if (s->ws) {
+        ws_feed(s, data, len);
+    } else if (s->collect) {
+        if (s->body.len + len > s->body_max) {
+            s->body_fn = NULL;
+            respond_full(s, 413, NULL, NULL, 0, META_ORIGIN);
+        } else if (buf_append(&s->body, data, len) < 0) {
+            s->body_fn = NULL;
+            respond_full(s, 500, NULL, NULL, 0, META_ORIGIN);
+        }
+    } else if (s->h.on_body) {
+        s->h.on_body(s, s->ctx, data, len);
     }
     return 0;
+}
+
+static void close_stream(cft_conn_t *c, cft_stream_t *s, bool completed)
+{
+    if (s->counted) {
+        c->num_requests--;
+    }
+    if (s->h.on_close) {
+        s->h.on_close(s, s->ctx, completed);
+    }
+    stream_unlink(c, s);
+    stream_free(s);
 }
 
 static int on_stream_close(nghttp2_session *session, int32_t stream_id, uint32_t error_code, void *user_data)
 {
     cft_conn_t *c = user_data;
-    stream_t *s = nghttp2_session_get_stream_user_data(session, stream_id);
+    cft_stream_t *s = nghttp2_session_get_stream_user_data(session, stream_id);
     if (!s) {
         return 0;
     }
-    if (s->counted) {
-        c->num_requests--;
-    }
+    nghttp2_session_set_stream_user_data(session, stream_id, NULL);
     if (s == c->control) {
         c->control = NULL;
         conn_fail(c, "control stream closed by edge");
     } else if (error_code != NGHTTP2_NO_ERROR) {
         CFT_LOGD(TAG, "stream %d reset (error %u)", (int)stream_id, (unsigned)error_code);
     }
-    nghttp2_session_set_stream_user_data(session, stream_id, NULL);
-    for (stream_t **pp = &c->streams; *pp; pp = &(*pp)->next) {
-        if (*pp == s) {
-            *pp = s->next;
-            break;
-        }
-    }
-    stream_free(s);
+    close_stream(c, s, error_code == NGHTTP2_NO_ERROR && s->resp_eof_sent);
     return 0;
 }
 
 static int on_frame_send(nghttp2_session *session, const nghttp2_frame *frame, void *user_data)
 {
-    (void)session;
-    (void)user_data;
     CFT_LOGD(TAG, "sent frame type %u stream %d flags 0x%02x len %u", frame->hd.type, (int)frame->hd.stream_id,
              frame->hd.flags, (unsigned)frame->hd.length);
     return 0;
@@ -723,18 +1059,12 @@ static int on_frame_send(nghttp2_session *session, const nghttp2_frame *frame, v
 static int on_invalid_frame(nghttp2_session *session, const nghttp2_frame *frame, int lib_error_code,
                             void *user_data)
 {
-    (void)session;
-    (void)user_data;
     CFT_LOGW(TAG, "invalid frame type %u on stream %d: %s", frame->hd.type, (int)frame->hd.stream_id,
              nghttp2_strerror(lib_error_code));
-    if (frame->hd.type == NGHTTP2_GOAWAY) {
-        CFT_LOGW(TAG, "GOAWAY last_stream_id=%d error=%u debug=%.*s", (int)frame->goaway.last_stream_id,
-                 (unsigned)frame->goaway.error_code, (int)frame->goaway.opaque_data_len, frame->goaway.opaque_data);
-    }
     return 0;
 }
 
-/* --- public API --- */
+/* --- connection API --- */
 
 cft_conn_t *cft_conn_new(const cft_conn_config_t *cfg)
 {
@@ -745,13 +1075,7 @@ cft_conn_t *cft_conn_new(const cft_conn_config_t *cfg)
     c->cfg = *cfg;
     c->alive = true;
     c->preface_left = NGHTTP2_CLIENT_MAGIC_LEN;
-    if (cfg->client_id) {
-        memcpy(c->client_id, cfg->client_id, 16);
-    } else {
-        cft_port_random(c->client_id, 16);
-        c->client_id[6] = (c->client_id[6] & 0x0f) | 0x40; /* UUID v4 */
-        c->client_id[8] = (c->client_id[8] & 0x3f) | 0x80;
-    }
+    memcpy(c->client_id, cfg->client_id, 16);
 
     nghttp2_session_callbacks *cbs;
     if (nghttp2_session_callbacks_new(&cbs) != 0) {
@@ -784,11 +1108,15 @@ void cft_conn_free(cft_conn_t *c)
     if (!c) {
         return;
     }
+    /* nghttp2_session_del() does not report stream closes; tell the
+     * application about the streams that were still open. */
     nghttp2_session_del(c->h2);
     while (c->streams) {
-        stream_t *s = c->streams;
-        c->streams = s->next;
-        stream_free(s);
+        cft_stream_t *s = c->streams;
+        if (s == c->control) {
+            c->control = NULL;
+        }
+        close_stream(c, s, false);
     }
     cft_rpc_free(c->rpc);
     free(c);
@@ -856,14 +1184,36 @@ int cft_conn_recv(cft_conn_t *c, const uint8_t *data, size_t len)
     return c->alive ? 0 : -1;
 }
 
+/* Calls on_writable for streams whose queued data has been taken; returns
+ * true if any was called. */
+static bool notify_writable(cft_conn_t *c)
+{
+    bool called = false;
+    for (cft_stream_t *s = c->streams; s; s = s->next) {
+        if (s->want_writable) {
+            s->want_writable = false;
+            if (s->h.on_writable && !s->resp_end) {
+                s->h.on_writable(s, s->ctx);
+                called = true;
+                break; /* the callback may have changed the stream list */
+            }
+        }
+    }
+    return called;
+}
+
 long cft_conn_send_data(cft_conn_t *c, const uint8_t **data)
 {
-    nghttp2_ssize n = nghttp2_session_mem_send2(c->h2, data);
-    if (n < 0) {
-        conn_fail(c, nghttp2_strerror((int)n));
-        return -1;
+    for (;;) {
+        nghttp2_ssize n = nghttp2_session_mem_send2(c->h2, data);
+        if (n < 0) {
+            conn_fail(c, nghttp2_strerror((int)n));
+            return -1;
+        }
+        if (n > 0 || !notify_writable(c)) {
+            return (long)n;
+        }
     }
-    return (long)n;
 }
 
 void cft_conn_tick(cft_conn_t *c, int64_t now_ms)

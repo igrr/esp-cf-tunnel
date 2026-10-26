@@ -6,6 +6,7 @@
  *            [--edge HOST[:PORT]] [--plain] [--handler-delay-ms N] [-v]
  */
 #include <getopt.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -60,16 +61,20 @@ static bool parse_uuid(const char *s, uint8_t out[16])
     return n == 32;
 }
 
-static void demo_handler(void *arg, const cft_request_t *req, cft_response_t *resp)
+/* --- demo endpoints, also used by test_host.py --- */
+
+static bool path_is(const cft_request_t *req, const char *path)
 {
-    (void)arg;
-    if (handler_delay_ms) {
-        usleep((useconds_t)handler_delay_ms * 1000);
-    }
+    size_t n = strcspn(req->path, "?");
+    return n == strlen(path) && strncmp(req->path, path, n) == 0;
+}
+
+static void hello(cft_stream_t *s, const cft_request_t *req)
+{
     char body[4096];
     int n = snprintf(body, sizeof(body),
-                     "Hello from the esp-cf-tunnel host runner\n\n%s %s\nhost: %s\nbody: %zu bytes\n\nheaders:\n",
-                     req->method, req->path, req->authority, req->body_len);
+                     "Hello from the esp-cf-tunnel host runner\n\n%s %s\nhost: %s\n\nheaders:\n",
+                     req->method, req->path, req->authority);
     for (size_t i = 0; i < req->num_headers && n < (int)sizeof(body) - 1; i++) {
         n += snprintf(body + n, sizeof(body) - (size_t)n, "  %s: %s\n", req->headers[i].name,
                       req->headers[i].value);
@@ -77,9 +82,150 @@ static void demo_handler(void *arg, const cft_request_t *req, cft_response_t *re
     if (n >= (int)sizeof(body)) {
         n = sizeof(body) - 1;
     }
-    cft_response_add_header(resp, "Content-Type", "text/plain; charset=utf-8");
-    cft_response_add_header(resp, "X-Served-By", "esp-cf-tunnel");
-    cft_response_set_body(resp, body, (size_t)n);
+    cft_header_t hdrs[] = {
+        {"Content-Type", "text/plain; charset=utf-8"},
+        {"X-Served-By", "esp-cf-tunnel"},
+    };
+    cft_stream_send_headers(s, 200, hdrs, 2);
+    cft_stream_write(s, body, (size_t)n);
+    cft_stream_end(s);
+}
+
+/* /echo: the request body, streamed back as it arrives */
+static void echo_body(cft_stream_t *s, void *ctx, const uint8_t *data, size_t len)
+{
+    cft_stream_write(s, data, len);
+}
+
+static void echo_end(cft_stream_t *s, void *ctx)
+{
+    cft_stream_end(s);
+}
+
+/* /upload: whole body, then its length */
+static void upload_done(cft_stream_t *s, void *ctx, const uint8_t *body, size_t len)
+{
+    char msg[64];
+    int n = snprintf(msg, sizeof(msg), "received %zu bytes\n", len);
+    cft_stream_respond(s, 200, "text/plain", msg, (size_t)n);
+}
+
+/* /big?size=N: N bytes of a repeating pattern, generated as the edge takes them */
+typedef struct {
+    size_t left;
+    size_t pos;
+} big_t;
+
+static void big_fill(cft_stream_t *s, void *ctx)
+{
+    big_t *b = ctx;
+    uint8_t chunk[4096];
+    size_t n = b->left < sizeof(chunk) ? b->left : sizeof(chunk);
+    for (size_t i = 0; i < n; i++) {
+        chunk[i] = (uint8_t)('a' + (b->pos + i) % 26);
+    }
+    b->pos += n;
+    b->left -= n;
+    cft_stream_write(s, chunk, n);
+    if (b->left == 0) {
+        cft_stream_end(s);
+    }
+}
+
+static void big_close(cft_stream_t *s, void *ctx, bool completed)
+{
+    free(ctx);
+}
+
+static void big(cft_stream_t *s, const cft_request_t *req)
+{
+    const char *q = strstr(req->path, "size=");
+    big_t *b = calloc(1, sizeof(*b));
+    b->left = q ? strtoul(q + 5, NULL, 10) : 100000;
+    char clen[24];
+    snprintf(clen, sizeof(clen), "%zu", b->left);
+    cft_header_t hdrs[] = {{"Content-Type", "application/octet-stream"}, {"Content-Length", clen}};
+    cft_stream_handlers_t h = {.on_writable = big_fill, .on_close = big_close};
+    cft_stream_set_handlers(s, &h, b);
+    cft_stream_send_headers(s, 200, hdrs, 2);
+    big_fill(s, b);
+}
+
+/* /ws: echoes messages; "close" closes */
+static void ws_message(cft_stream_t *s, void *ctx, cft_ws_opcode_t op, const uint8_t *data, size_t len)
+{
+    if (op == CFT_WS_TEXT && len == 5 && memcmp(data, "close", 5) == 0) {
+        cft_ws_close(s, 1000, "bye");
+        return;
+    }
+    cft_ws_send(s, op, data, len);
+}
+
+/* /later: answered from another thread through cft_tunnel_post(). The
+ * context is freed by whichever runs last of the posted function and
+ * on_close; both run on the tunnel thread. */
+typedef struct {
+    cft_stream_t *s; /* NULL once closed */
+    bool answered;
+} later_t;
+
+static void later_respond(void *arg)
+{
+    later_t *l = arg;
+    if (!l->s) {
+        free(l);
+        return;
+    }
+    l->answered = true;
+    cft_stream_respond(l->s, 200, "text/plain", "later\n", 6);
+}
+
+static void *later_thread(void *arg)
+{
+    usleep(200 * 1000);
+    cft_tunnel_post(s_tunnel, later_respond, arg);
+    return NULL;
+}
+
+static void later_close(cft_stream_t *s, void *ctx, bool completed)
+{
+    later_t *l = ctx;
+    if (l->answered) {
+        free(l);
+    } else {
+        l->s = NULL;
+    }
+}
+
+static void on_request(void *arg, cft_stream_t *s, const cft_request_t *req)
+{
+    if (handler_delay_ms) {
+        usleep((useconds_t)handler_delay_ms * 1000);
+    }
+    if (req->is_websocket && path_is(req, "/ws")) {
+        cft_stream_handlers_t h = {.on_ws_message = ws_message};
+        cft_stream_set_handlers(s, &h, NULL);
+        cft_ws_accept(s, NULL);
+    } else if (path_is(req, "/echo")) {
+        cft_stream_handlers_t h = {.on_body = echo_body, .on_body_end = echo_end};
+        cft_stream_set_handlers(s, &h, NULL);
+        cft_header_t hdrs[] = {{"Content-Type", "application/octet-stream"}};
+        cft_stream_send_headers(s, 200, hdrs, 1);
+    } else if (path_is(req, "/upload")) {
+        cft_stream_read_body(s, 0, upload_done, NULL);
+    } else if (path_is(req, "/big")) {
+        big(s, req);
+    } else if (path_is(req, "/later")) {
+        later_t *l = calloc(1, sizeof(*l));
+        l->s = s;
+        cft_stream_handlers_t h = {.on_close = later_close};
+        cft_stream_set_handlers(s, &h, l);
+        pthread_t thread;
+        pthread_create(&thread, NULL, later_thread, l);
+        pthread_detach(thread);
+    } else {
+        hello(s, req);
+    }
 }
 
 static void on_event(void *arg, const cft_event_t *ev)
@@ -112,7 +258,7 @@ int main(int argc, char **argv)
 {
     const char *token_file = NULL;
     cft_tunnel_config_t cfg = {
-        .handler = demo_handler,
+        .on_request = on_request,
         .on_event = on_event,
         .version = "esp-cf-tunnel-host/0.1",
         .arch = "linux_amd64",

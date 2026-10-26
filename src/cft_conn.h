@@ -39,12 +39,12 @@ typedef struct {
     const uint8_t *local_ip;       /* our address on the edge socket, informational */
     size_t local_ip_len;           /* 4 or 16 */
     uint8_t num_previous_attempts;
-    cft_handler_fn handler;
-    void *handler_arg;
+    cft_request_fn on_request;
+    void *request_arg;
     cft_event_fn on_event;         /* events carry conn_index */
     void *event_arg;
-    size_t max_request_body;       /* larger requests get 413; 0 = 16 KiB */
-    uint32_t max_concurrent_streams; /* requests in flight; more get 503. 0 = 16 */
+    size_t max_request_body;       /* default body / WebSocket message limit; 0 = 16 KiB */
+    uint32_t max_concurrent_streams; /* open streams; more get 503. 0 = 16 */
 } cft_conn_config_t;
 
 typedef struct cft_conn cft_conn_t;
