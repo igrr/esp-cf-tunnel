@@ -1,0 +1,26 @@
+menu "Tunnel example"
+
+    config EXAMPLE_DEBUG_TUNNEL
+        bool "Debug logging for the tunnel connection (needs LOG_MAXIMUM_LEVEL_DEBUG)"
+        default n
+
+    config EXAMPLE_ETH_MDC_GPIO
+        int "SMI MDC GPIO"
+        default 31 if IDF_TARGET_ESP32P4
+        default 23
+
+    config EXAMPLE_ETH_MDIO_GPIO
+        int "SMI MDIO GPIO"
+        default 52 if IDF_TARGET_ESP32P4
+        default 18
+
+    config EXAMPLE_ETH_PHY_RST_GPIO
+        int "PHY reset GPIO (-1 if not connected)"
+        default 51 if IDF_TARGET_ESP32P4
+        default 5
+
+    config EXAMPLE_ETH_PHY_ADDR
+        int "PHY address (-1 to detect)"
+        default -1
+
+endmenu

@@ -1,0 +1,11 @@
+version: "0.1.0"
+description: Cloudflare Tunnel connector (cloudflared HTTP/2 protocol)
+url: https://github.com/igrr/esp-cf-tunnel
+repository: https://github.com/igrr/esp-cf-tunnel.git
+dependencies:
+  idf: ">=5.4"
+  espressif/nghttp: "^1.65.0"
+files:
+  exclude:
+    - "test_apps/**/*"
+    - "tools/**/*"
