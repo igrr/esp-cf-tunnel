@@ -36,12 +36,13 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libnghttp2-dev libssl-dev ninja-build
-          pip install pytest pycapnp
+          sudo apt-get install -y libssl-dev ninja-build
+          pip install pytest pycapnp h2
       - name: Build
         run: |
           cmake -S test_apps/host -B test_apps/host/build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_FLAGS="-fsanitize=address,undefined -Werror"
+            -DCMAKE_BUILD_TYPE=Debug -DCFT_FETCH_NGHTTP2=ON -DCFT_WERROR=ON \
+            -DCMAKE_C_FLAGS="-fsanitize=address,undefined"
           cmake --build test_apps/host/build
       - name: Run tests
         run: pytest -v test_apps/host

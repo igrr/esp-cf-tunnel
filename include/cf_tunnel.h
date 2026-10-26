@@ -1,10 +1,11 @@
-/**
- * @file cf_tunnel.h
- * @brief Cloudflare Tunnel connector core: one HTTP/2 connection to the edge.
+/*
+ * Cloudflare Tunnel connector: serves HTTP requests that arrive through a
+ * Cloudflare Tunnel, using cloudflared's HTTP/2 protocol.
  *
- * cft_conn_t is one edge connection. It does no I/O itself: the caller
- * establishes TLS to the edge, passes received bytes to cft_conn_recv() and
- * writes out what cft_conn_send_data() returns.
+ * cft_tunnel_t keeps the configured number of connections to the edge open,
+ * reconnecting as needed. It runs on any platform that provides a
+ * cft_transport_ops_t (TLS over a non-blocking socket); on ESP-IDF,
+ * cf_tunnel_esp.h provides one and runs the tunnel in a task.
  */
 #pragma once
 
@@ -15,37 +16,6 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-/** TCP port of the tunnel edge */
-#define CFT_EDGE_PORT 7844
-/** TLS server name to use for the HTTP/2 transport */
-#define CFT_EDGE_SNI "h2.cftunnel.com"
-/** First edge region (target of the _v2-origintunneld._tcp.argotunnel.com SRV record) */
-#define CFT_EDGE_REGION1 "region1.v2.argotunnel.com"
-/** Second edge region */
-#define CFT_EDGE_REGION2 "region2.v2.argotunnel.com"
-
-/** PEM of the CA that signs the edge certificate, NUL-terminated */
-extern const char *const cft_edge_ca_pem_str;
-
-/**
- * @brief Decoded tunnel token
- */
-typedef struct {
-    char account_tag[64];   /*!< Cloudflare account tag */
-    uint8_t tunnel_id[16];  /*!< Tunnel UUID */
-    uint8_t secret[64];     /*!< Tunnel secret */
-    size_t secret_len;      /*!< Length of the secret in bytes */
-} cft_token_t;
-
-/**
- * @brief Parse a tunnel token
- *
- * @param token  Token as shown by the dashboard or `cloudflared tunnel token`
- * @param[out] out  Decoded token
- * @return true on success, false if the token is malformed
- */
-bool cft_token_parse(const char *token, cft_token_t *out);
 
 /* --- Requests --- */
 
@@ -81,12 +51,14 @@ typedef enum {
     CFT_EVENT_REGISTERED,          /* connection is live */
     CFT_EVENT_REGISTRATION_FAILED, /* edge refused; see retry fields */
     CFT_EVENT_CONFIG_UPDATED,      /* remote configuration pushed by the edge */
+    CFT_EVENT_DRAINING,            /* edge asked to move off this connection */
     CFT_EVENT_UNREGISTERED,        /* graceful shutdown acknowledged */
-    CFT_EVENT_CLOSED,              /* connection is unusable; close the socket */
+    CFT_EVENT_CLOSED,              /* connection closed */
 } cft_event_type_t;
 
 typedef struct {
     cft_event_type_t type;
+    uint8_t conn_index;            /* which connection (0..3) */
     union {
         struct {
             char connection_id[37];
@@ -111,47 +83,66 @@ typedef struct {
 
 typedef void (*cft_event_fn)(void *arg, const cft_event_t *ev);
 
-/* --- Connection --- */
+/* --- Transport --- */
+
+/*
+ * TLS client over a non-blocking socket. All functions are called from the
+ * tunnel's thread.
+ */
+typedef struct {
+    /* Starts connecting. ca_pem verifies the server, sni is also the name to
+     * check. Returns a connection handle or NULL. May block for DNS. */
+    void *(*open)(void *ctx, const char *host, uint16_t port, const char *sni, const char *ca_pem);
+    /* Advances the connection and handshake: 1 done, 0 in progress, -1 failed */
+    int (*connect)(void *conn);
+    /* Socket to wait on */
+    int (*get_fd)(void *conn);
+    /* >0 bytes read, 0 nothing available now, <0 closed or failed */
+    long (*read)(void *conn, uint8_t *buf, size_t len);
+    /* >=0 bytes written (0: try again later), <0 failed. After a short write,
+     * the next call must pass the remaining bytes again. */
+    long (*write)(void *conn, const uint8_t *buf, size_t len);
+    /* Decrypted bytes buffered in the transport, readable without waiting */
+    size_t (*pending)(void *conn);
+    /* Local address of the socket; returns its length (4 or 16) or 0 */
+    size_t (*local_ip)(void *conn, uint8_t ip[16]);
+    void (*close)(void *conn);
+    void *ctx;
+} cft_transport_ops_t;
+
+/* --- Tunnel --- */
 
 typedef struct {
-    const cft_token_t *token;
-    uint8_t conn_index;            /* 0..3; index 0 receives configuration pushes */
-    const uint8_t *client_id;      /* 16 bytes identifying this connector; NULL = random */
-    const char *version;           /* reported client version */
-    const char *arch;              /* reported architecture, e.g. "esp32p4" */
-    const uint8_t *local_ip;       /* our address on the edge socket, informational */
-    size_t local_ip_len;           /* 4 or 16 */
-    uint8_t num_previous_attempts;
-    cft_handler_fn handler;
+    const char *token;               /* tunnel token; copied */
+    cft_handler_fn handler;          /* called from the tunnel thread */
     void *handler_arg;
-    cft_event_fn on_event;
+    cft_event_fn on_event;           /* optional, called from the tunnel thread */
     void *event_arg;
-    size_t max_request_body;       /* larger requests get 413; 0 = 16 KiB */
-    uint32_t max_concurrent_streams; /* requests in flight; more get 503. 0 = 16 */
-} cft_conn_config_t;
+    uint8_t num_connections;         /* 1..4; 0 = 1 */
+    const uint8_t *connector_id;     /* 16 bytes; NULL = random. Keep it stable across restarts:
+                                        the edge then replaces the connections of the previous run
+                                        instead of routing requests to them until they time out. */
+    const char *edge_hosts[2];       /* edge addresses (one per region); NULL = Cloudflare's */
+    uint16_t edge_port;              /* 0 = 7844 */
+    const char *version;             /* reported to the edge; NULL = component default */
+    const char *arch;                /* reported to the edge; NULL = "unknown" */
+    size_t max_request_body;         /* larger requests get 413; 0 = 16 KiB */
+    uint32_t max_concurrent_streams; /* requests in flight per connection; more get 503. 0 = 16 */
+} cft_tunnel_config_t;
 
-typedef struct cft_conn cft_conn_t;
+typedef struct cft_tunnel cft_tunnel_t;
 
-/* The config (and the token it points to) must outlive the connection. */
-cft_conn_t *cft_conn_new(const cft_conn_config_t *cfg);
-void cft_conn_free(cft_conn_t *conn);
+/* Returns NULL if the token is invalid or memory runs out. */
+cft_tunnel_t *cft_tunnel_new(const cft_tunnel_config_t *cfg, const cft_transport_ops_t *transport);
 
-/* Feeds bytes read from the TLS connection. Returns <0 if the connection is
- * no longer usable. */
-int cft_conn_recv(cft_conn_t *conn, const uint8_t *data, size_t len);
+/* Runs the tunnel until cft_tunnel_request_stop() is called and the
+ * connections have unregistered (or the stop timeout has passed). */
+void cft_tunnel_run(cft_tunnel_t *tunnel);
 
-/* Returns bytes to write to the TLS connection, valid until the next call
- * into the connection; 0 when there is nothing to send. Must be called until
- * it returns 0 after every cft_conn_recv() and cft_conn_shutdown(). Returns
- * <0 on error. */
-long cft_conn_send_data(cft_conn_t *conn, const uint8_t **data);
+/* Thread-safe; cft_tunnel_run() returns soon after. */
+void cft_tunnel_request_stop(cft_tunnel_t *tunnel, uint32_t stop_timeout_ms);
 
-/* Begins graceful shutdown: unregisters, then sends GOAWAY once the edge
- * acknowledges. CFT_EVENT_UNREGISTERED follows. */
-int cft_conn_shutdown(cft_conn_t *conn);
-
-/* True while the connection has not failed or finished. */
-bool cft_conn_is_alive(const cft_conn_t *conn);
+void cft_tunnel_free(cft_tunnel_t *tunnel);
 
 #ifdef __cplusplus
 }

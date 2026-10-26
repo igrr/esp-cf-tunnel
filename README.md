@@ -34,6 +34,15 @@ ESP_ERROR_CHECK(cft_tunnel_start(&cfg, &tunnel));
 The handler runs in the tunnel task once the full request has arrived.
 Request bodies over `max_request_body` (16 KiB by default) get 413.
 
+Connections: by default the tunnel keeps one connection to the edge
+(`num_connections`, up to 4, spread over both edge regions). When the edge
+drains a connection, a replacement is opened before the old one closes; a
+lost connection is reconnected with backoff, and a connection that stops
+answering HTTP/2 PINGs is dropped within about 25 s. On ESP-IDF the connector
+ID is derived from the MAC address, so after a reboot the edge replaces the
+old connections at once instead of routing requests to them until they time
+out.
+
 The component needs `CONFIG_MBEDTLS_SSL_PROTO_TLS1_3=y`: the edge refuses
 TLS 1.2. The edge sends full 16 KB TLS records, but the device's own records
 can be small: `CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN=y` with
@@ -62,8 +71,9 @@ for nghttp2.
   request. Response headers are also sent base64-encoded in
   `cf-cloudflared-response-headers` (`src/cft_conn.c`).
 
-`src/` holds the portable core, which does no I/O; `port/esp/` connects it to
-esp-tls and runs it in a task.
+`src/` holds the portable core: `cft_conn.c` handles one connection and does
+no I/O, `cft_tunnel.c` supervises the connections over a `cft_transport_ops_t`.
+`port/esp/` provides the esp-tls transport and runs the tunnel in a task.
 
 ### Edge behaviour worth knowing
 
@@ -113,17 +123,22 @@ test_apps/host/build/cft_host --token-file tunnel.token
 ```
 
 Every request routed to the tunnel is answered by the demo handler in
-`test_apps/host/main.c`. Ctrl-C unregisters the connection.
+`test_apps/host/main.c`. Ctrl-C unregisters the connections. Options:
+`--connections N`, `--connector-id UUID`, `--edge HOST[:PORT]`, `--plain`
+(no TLS, for the fake edge), `--handler-delay-ms N`, `--max-streams N`, `-v`.
 
 ## Host tests
 
-`test_apps/host/test_host.py` runs the host tests, including the
-registration RPC client against a mock server built on the reference Cap'n
-Proto implementation (pycapnp). The schemas it needs are in
-`test_apps/host/schemas`.
+`test_apps/host/test_host.py` runs the host tests:
+
+- the registration RPC client against a mock server built on the reference
+  Cap'n Proto implementation (pycapnp), with schemas in `test_apps/host/schemas`;
+- the host runner against `fake_edge.py`, which plays the edge's side of the
+  protocol (HTTP/2 client, control stream, registration, configuration
+  pushes, drains, lost and unresponsive connections).
 
 ```sh
-pip install pytest pycapnp
+pip install pytest pycapnp h2
 pytest test_apps/host
 ```
 

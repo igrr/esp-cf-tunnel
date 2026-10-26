@@ -9,7 +9,7 @@
 #include <string.h>
 #include <strings.h>
 
-#include "cf_tunnel.h"
+#include "cft_conn.h"
 #include "cft_port.h"
 #include "cft_rpc.h"
 #include "cft_util.h"
@@ -27,6 +27,16 @@ static const char *TAG = "cft_conn";
 #define HDR_RESP_META "cf-cloudflared-response-meta"
 #define META_ORIGIN "{\"src\":\"origin\"}"
 #define META_CLOUDFLARED "{\"src\":\"cloudflared\"}"
+
+/* The edge pings every few seconds. If it goes quiet, ping it ourselves and
+ * give up when that goes unanswered too. */
+#ifndef CFT_IDLE_PING_MS
+#define CFT_IDLE_PING_MS 15000
+#endif
+#ifndef CFT_PING_TIMEOUT_MS
+#define CFT_PING_TIMEOUT_MS 10000
+#endif
+#define REGISTER_TIMEOUT_MS 15000
 
 static const char *const default_features[] = {
     "serialized_headers",
@@ -90,6 +100,11 @@ struct cft_conn {
     uint8_t ftype;
     uint32_t payload_left;
     uint32_t payload_pos;
+    /* Timers, see cft_conn_tick() */
+    int64_t created_ms;   /* 0 until the first tick */
+    int64_t last_rx_ms;
+    int64_t ping_sent_ms; /* 0 if no PING outstanding */
+    bool rx_since_tick;
     bool alive;
     bool registered;
     bool shutting_down;
@@ -204,8 +219,9 @@ int cft_response_set_body(cft_response_t *resp, const void *data, size_t len)
 
 /* --- events --- */
 
-static void emit(cft_conn_t *c, const cft_event_t *ev)
+static void emit(cft_conn_t *c, cft_event_t *ev)
 {
+    ev->conn_index = c->cfg.conn_index;
     if (c->cfg.on_event) {
         c->cfg.on_event(c->cfg.event_arg, ev);
     }
@@ -624,9 +640,16 @@ static int on_frame_recv(nghttp2_session *session, const nghttp2_frame *frame, v
                  frame->goaway.opaque_data_len ? ": " : "", (int)frame->goaway.opaque_data_len,
                  frame->goaway.opaque_data);
         if (!c->shutting_down) {
-            /* Edge is draining this connection (e.g. maintenance): unregister
-             * so the caller can reconnect elsewhere. */
+            /* Edge is draining this connection (e.g. maintenance). Let the
+             * supervisor open a replacement, and unregister this one. */
+            cft_event_t ev = {.type = CFT_EVENT_DRAINING};
+            emit(c, &ev);
             cft_conn_shutdown(c);
+        }
+        break;
+    case NGHTTP2_PING:
+        if (frame->hd.flags & NGHTTP2_FLAG_ACK) {
+            c->ping_sent_ms = 0;
         }
         break;
     default:
@@ -822,6 +845,7 @@ static uint8_t *fix_goaway(cft_conn_t *c, const uint8_t *data, size_t len)
 
 int cft_conn_recv(cft_conn_t *c, const uint8_t *data, size_t len)
 {
+    c->rx_since_tick = true;
     uint8_t *patched = fix_goaway(c, data, len);
     nghttp2_ssize n = nghttp2_session_mem_recv2(c->h2, patched ? patched : data, len);
     free(patched);
@@ -840,6 +864,35 @@ long cft_conn_send_data(cft_conn_t *c, const uint8_t **data)
         return -1;
     }
     return (long)n;
+}
+
+void cft_conn_tick(cft_conn_t *c, int64_t now_ms)
+{
+    if (!c->alive) {
+        return;
+    }
+    if (c->created_ms == 0) {
+        c->created_ms = now_ms;
+        c->last_rx_ms = now_ms;
+    }
+    if (c->rx_since_tick) {
+        c->rx_since_tick = false;
+        c->last_rx_ms = now_ms;
+        c->ping_sent_ms = 0; /* anything from the edge proves the link works */
+    }
+    if (!c->registered && !c->shutting_down && now_ms - c->created_ms > REGISTER_TIMEOUT_MS) {
+        conn_fail(c, "registration timed out");
+        return;
+    }
+    if (c->ping_sent_ms) {
+        if (now_ms - c->ping_sent_ms > CFT_PING_TIMEOUT_MS) {
+            conn_fail(c, "edge stopped responding");
+        }
+    } else if (now_ms - c->last_rx_ms > CFT_IDLE_PING_MS) {
+        if (nghttp2_submit_ping(c->h2, NGHTTP2_FLAG_NONE, NULL) == 0) {
+            c->ping_sent_ms = now_ms;
+        }
+    }
 }
 
 int cft_conn_shutdown(cft_conn_t *c)

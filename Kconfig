@@ -1,0 +1,14 @@
+menu "Cloudflare Tunnel (esp-cf-tunnel)"
+
+    config CF_TUNNEL_TASK_STACK_SIZE
+        int "Tunnel task stack size"
+        default 8192
+        help
+            Stack of the task started by cft_tunnel_start(). Request handlers
+            run in this task, so add what they need.
+
+    config CF_TUNNEL_TASK_PRIORITY
+        int "Tunnel task priority"
+        default 5
+
+endmenu

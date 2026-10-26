@@ -1,6 +1,5 @@
 /*
- * ESP-IDF runner: keeps one tunnel connection to the Cloudflare edge alive
- * in a FreeRTOS task, reconnecting with backoff.
+ * ESP-IDF integration: runs a cft_tunnel_t in a FreeRTOS task over esp-tls.
  *
  * Requires CONFIG_MBEDTLS_SSL_PROTO_TLS1_3 (the edge refuses TLS 1.2).
  */
@@ -13,21 +12,18 @@
 extern "C" {
 #endif
 
-typedef struct {
-    const char *token;               /* tunnel token; copied */
-    cft_handler_fn handler;          /* called from the tunnel task */
-    void *handler_arg;
-    cft_event_fn on_event;           /* optional, called from the tunnel task */
-    void *event_arg;
-    const char *version;             /* reported to the edge; NULL = component default */
-    size_t max_request_body;         /* 0 = 16 KiB */
-    uint32_t max_concurrent_streams; /* requests in flight; more get 503. 0 = 16 */
-    uint32_t task_stack_size;        /* 0 = 8 KiB */
-    unsigned task_priority;          /* 0 = 5 */
-} cft_tunnel_config_t;
+/* esp-tls based transport, used by cft_tunnel_start() */
+extern const cft_transport_ops_t cft_transport_esp_tls;
 
-typedef struct cft_tunnel *cft_tunnel_handle_t;
+typedef struct cft_tunnel_esp *cft_tunnel_handle_t;
 
+/*
+ * Starts the tunnel task. Defaults that differ from cft_tunnel_new():
+ * - connector_id NULL: derived from the base MAC address and the tunnel ID,
+ *   so the device keeps its connector ID across reboots;
+ * - arch NULL: CONFIG_IDF_TARGET.
+ * Task stack size and priority come from Kconfig (CF_TUNNEL_TASK_*).
+ */
 esp_err_t cft_tunnel_start(const cft_tunnel_config_t *cfg, cft_tunnel_handle_t *out);
 
 /* Unregisters from the edge (waiting up to timeout_ms) and stops the task. */

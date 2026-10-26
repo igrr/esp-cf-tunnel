@@ -1,6 +1,6 @@
 #include <string.h>
 
-#include "cf_tunnel.h"
+#include "cft_conn.h"
 #include "cft_ca.h"
 #include "cft_util.h"
 
