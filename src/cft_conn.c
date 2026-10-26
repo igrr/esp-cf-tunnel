@@ -617,10 +617,10 @@ static int on_frame_recv(nghttp2_session *session, const nghttp2_frame *frame, v
         }
         break;
     case NGHTTP2_RST_STREAM:
-        CFT_LOGD(TAG, "edge reset stream %d (error %u)", (int)frame->hd.stream_id, frame->rst_stream.error_code);
+        CFT_LOGD(TAG, "edge reset stream %d (error %u)", (int)frame->hd.stream_id, (unsigned)frame->rst_stream.error_code);
         break;
     case NGHTTP2_GOAWAY:
-        CFT_LOGI(TAG, "edge sent GOAWAY (error %u%s%.*s)", frame->goaway.error_code,
+        CFT_LOGI(TAG, "edge sent GOAWAY (error %u%s%.*s)", (unsigned)frame->goaway.error_code,
                  frame->goaway.opaque_data_len ? ": " : "", (int)frame->goaway.opaque_data_len,
                  frame->goaway.opaque_data);
         if (!c->shutting_down) {
@@ -675,7 +675,7 @@ static int on_stream_close(nghttp2_session *session, int32_t stream_id, uint32_t
         c->control = NULL;
         conn_fail(c, "control stream closed by edge");
     } else if (error_code != NGHTTP2_NO_ERROR) {
-        CFT_LOGD(TAG, "stream %d reset (error %u)", (int)stream_id, error_code);
+        CFT_LOGD(TAG, "stream %d reset (error %u)", (int)stream_id, (unsigned)error_code);
     }
     nghttp2_session_set_stream_user_data(session, stream_id, NULL);
     for (stream_t **pp = &c->streams; *pp; pp = &(*pp)->next) {
@@ -706,7 +706,7 @@ static int on_invalid_frame(nghttp2_session *session, const nghttp2_frame *frame
              nghttp2_strerror(lib_error_code));
     if (frame->hd.type == NGHTTP2_GOAWAY) {
         CFT_LOGW(TAG, "GOAWAY last_stream_id=%d error=%u debug=%.*s", (int)frame->goaway.last_stream_id,
-                 frame->goaway.error_code, (int)frame->goaway.opaque_data_len, frame->goaway.opaque_data);
+                 (unsigned)frame->goaway.error_code, (int)frame->goaway.opaque_data_len, frame->goaway.opaque_data);
     }
     return 0;
 }

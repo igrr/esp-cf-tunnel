@@ -4,8 +4,10 @@ CONFIG_ETH_USE_ESP32_EMAC=y
 # The tunnel edge only accepts TLS 1.3
 CONFIG_MBEDTLS_SSL_PROTO_TLS1_3=y
 CONFIG_ESP_TLS_USING_MBEDTLS=y
-# TLS records from the edge can be 16 KB; buffers are allocated only while needed
-CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+# Records from the edge can be 16 KB, ours are small. (MBEDTLS_DYNAMIC_BUFFER
+# would save more, but IDF 5.x does not allow it together with TLS 1.3.)
+CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN=y
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=4096
 # Partition table with the "dotenv" partition used by nvs-dotenv
 CONFIG_PARTITION_TABLE_CUSTOM=y
