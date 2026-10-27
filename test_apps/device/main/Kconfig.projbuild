@@ -1,0 +1,42 @@
+menu "Device test app"
+
+    config TEST_NUM_CONNECTIONS
+        int "Tunnel connections"
+        range 1 4
+        default 2
+
+    config TEST_MAX_STREAMS
+        int "Concurrent streams per connection"
+        default 24
+
+    config TEST_STREAM_WINDOW_KB
+        int "HTTP/2 receive window per stream (KiB)"
+        default 64
+        help
+            Data held for slow consumers is bounded by about this plus 64 KiB per
+            connection; with two connections, 256 KiB at 64.
+
+    config TEST_POSTER_THREADS
+        int "Threads posting work to the tunnel"
+        default 1
+
+    config TEST_ETH_MDC_GPIO
+        int "SMI MDC GPIO"
+        default 31 if IDF_TARGET_ESP32P4
+        default 23
+
+    config TEST_ETH_MDIO_GPIO
+        int "SMI MDIO GPIO"
+        default 52 if IDF_TARGET_ESP32P4
+        default 18
+
+    config TEST_ETH_PHY_RST_GPIO
+        int "PHY reset GPIO (-1 if not connected)"
+        default 51 if IDF_TARGET_ESP32P4
+        default 5
+
+    config TEST_ETH_PHY_ADDR
+        int "PHY address (-1 to detect)"
+        default -1
+
+endmenu

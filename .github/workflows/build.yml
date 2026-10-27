@@ -52,12 +52,13 @@ jobs:
     strategy:
       matrix:
         idf_ver: ["release-v5.4", "release-v5.5", "release-v6.0", "latest"]
+        app: ["examples/tunnel_ethernet", "test_apps/device"]
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-      - name: Build example
+      - name: Build ${{ matrix.app }}
         uses: espressif/esp-idf-ci-action@v1
         with:
           esp_idf_version: ${{ matrix.idf_ver }}
           target: esp32p4
-          path: examples/tunnel_ethernet
+          path: ${{ matrix.app }}

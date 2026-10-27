@@ -144,6 +144,33 @@ about 270 KB/s, an upload to an origin that stalls) and about 60 KB for a
 the device's flow control stops it (64 KB per stream). These figures are for
 IDF's default lwIP settings; see below for faster ones.
 
+### Memory under load
+
+What a busy tunnel holds, besides the fixed cost above:
+
+- each open stream (request, WebSocket) takes about 2 KB: its headers and
+  nghttp2's state;
+- response data waiting for the edge is queued in pieces of at most 4 KB, so
+  a large response does not need a large free block; handlers should write
+  more from `on_writable` rather than queue everything at once;
+- request data: the edge may send `stream_window` of a request body ahead.
+  While a stream's body is paused (`cft_stream_pause_body()`, or a proxied
+  origin that reads slowly), the connection's window is held back too, so
+  the data held for paused streams is at most `stream_window` + 64 KiB per
+  connection, and one stalled stream cannot stop the others;
+- each proxied request also has a socket to the origin: up to
+  `proxy_buffer_size` queued in each direction, plus what lwIP has received
+  from the origin while the edge is slower, up to `CONFIG_LWIP_TCP_WND_DEFAULT`.
+  A proxied upload whose origin takes nothing for 30 s is aborted.
+
+When memory runs short, new requests get 503 while less than
+`CONFIG_CF_TUNNEL_MIN_FREE_HEAP` is free (32 KiB by default), and a stream
+whose data cannot be queued is reset rather than sent with a gap. Keep
+`max_concurrent_streams`, `max_origin_connections`, `num_connections` and
+`stream_window` in proportion to the heap: the stress test below runs two
+connections with a 64 KiB window and four origin connections on the
+ESP32-P4's internal RAM.
+
 ### Throughput
 
 Each connection's speed is bounded by window / round-trip time, and with
@@ -211,7 +238,7 @@ and a 128 KiB window; both are in its `sdkconfig.defaults` and menuconfig.
 no I/O, `cft_tunnel.c` supervises the connections over a `cft_transport_ops_t`
 and routes requests (`cft_ingress.c`), and `cft_proxy.c` talks to other hosts
 over non-blocking sockets in the same select loop (`cft_poll.c`).
-`port/esp/` provides the esp-tls transport and runs the tunnel in a task.
+`port/esp/` provides the transport (mbedTLS over a non-blocking lwIP socket) and runs the tunnel in a task.
 
 ### Edge behaviour worth knowing
 
@@ -231,7 +258,13 @@ over non-blocking sockets in the same select loop (`cft_poll.c`).
 - `examples/tunnel_ethernet/`: Ethernet example serving a status page with
   live updates over a WebSocket (pin defaults for the ESP32-P4 Function EV
   Board)
-- `test_apps/host/`: Linux runner (OpenSSL), RPC test and mock server
+- `test_apps/common/`: request handlers shared by the host runner and the
+  device test app
+- `test_apps/host/`: Linux runner (OpenSSL), RPC test, mock server, fake edge
+  and the host tests
+- `test_apps/device/`: device test app for the stress test (Ethernet, heap
+  checks, network outages on request)
+- `test_apps/stress/`: stress test load generator and LAN origin services
 - `tools/capnp_layout.py`: prints the Cap'n Proto struct layouts used in
   `src/cft_rpc.c`
 
@@ -282,11 +315,42 @@ dashboard's public hostnames, proxying to other hosts), `--max-origins N`,
   bodies and WebSockets too. The connector runs with AddressSanitizer and
   UndefinedBehaviorSanitizer, and a leak check at exit;
 - proxying by ingress rules to HTTP, WebSocket and TCP origins on 127.0.0.2,
-  standing in for other hosts.
+  standing in for other hosts;
+- `test_chaos.py`: random concurrent operations of every kind for 30 s
+  (`CFT_CHAOS_SECONDS` for longer), with visitors that leave mid-transfer and
+  connections that are lost, drained or stop answering. At the end, every
+  stream must have been closed.
 
 ```sh
 pip install pytest pycapnp h2
 pytest test_apps/host
+```
+
+To check the thread-safe paths (`cft_tunnel_post()`), build with
+`-DCMAKE_C_FLAGS=-fsanitize=thread` into another directory and point
+`CFT_HOST_BUILD` at it.
+
+## Stress test
+
+`test_apps/stress/load.py` runs a mix of operations against
+`test_apps/device` through the real edge for hours: concurrent bursts, long
+and abandoned downloads and uploads, slow readers, WebSockets (echo, server
+push, long-lived, dropped), answers from another thread, streams the device
+resets, HTTP and `cloudflared access tcp` proxied to `origin.py` on another
+LAN host (including origins that fail), and Ethernet outages. It verifies
+every response, separates failures during outages, requests the device sheds
+(503) and errors from the edge itself, and records the device's heap at quiet
+checkpoints, so leaks show as a trend. The device app is built with heap
+poisoning, stack checks and component memory counters.
+
+```sh
+# on another LAN host
+python3 test_apps/stress/origin.py 192.168.1.10
+# device: set TUNNEL_TOKEN and the LAN_* services in test_apps/device/.env
+idf.py -C test_apps/device build flash monitor
+# load, from anywhere
+uv run --with httpx --with websockets test_apps/stress/load.py \
+    --url https://your-hostname --duration 10800 --out stress-out
 ```
 
 ## Contributing

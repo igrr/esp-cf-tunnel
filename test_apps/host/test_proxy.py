@@ -37,6 +37,8 @@ class _OriginHandler(socketserver.StreamRequestHandler):
             headers.append((name.strip(), value.strip()))
         hdr = {n.lower(): v for n, v in headers}
         path, _, query = target.partition("?")
+        if path.startswith("/lan/"):  # the test handlers' proxy prefix
+            path = path[4:]
         params = dict(p.split("=", 1) for p in query.split("&") if "=" in p)
         self.server.requests.append({"method": method, "target": target, "headers": headers})
 
@@ -66,6 +68,9 @@ class _OriginHandler(socketserver.StreamRequestHandler):
             self.wfile.write(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % size)
             for i in range(0, size, 65536):
                 self.wfile.write(bytes(ord("a") + (i + j) % 26 for j in range(min(65536, size - i))))
+        elif path == "/drop":
+            # Promises more than it sends, then closes
+            self.wfile.write(b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n" + b"d" * 3000)
         elif path == "/missing":
             self.wfile.write(b"HTTP/1.1 404 Not Found\r\nContent-Length: 4\r\nX-Origin: yes\r\n\r\nnope")
         else:
@@ -102,6 +107,9 @@ class _Server(socketserver.ThreadingTCPServer):
         super().__init__((ORIGIN_HOST, 0), handler)
         self.port = self.server_address[1]
         threading.Thread(target=self.serve_forever, daemon=True).start()
+
+    def handle_error(self, request, client_address):
+        pass  # visitors that go away reset the proxy's connection; not interesting
 
     def server_bind(self):
         if self.rcvbuf:

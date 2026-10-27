@@ -213,6 +213,26 @@ def test_pause_body(edge, connector):
     assert resp.body == b"received 1000000 bytes\n"
 
 
+def test_paused_stream_does_not_block_others(edge, connector):
+    """A paused stream holds connection window too, but at most a stream's worth"""
+    connector()
+    [conn] = edge.wait_registered()
+
+    async def run():
+        paused = conn.open_stream("POST", "/pause", body=b"p" * 1_000_000)
+        await asyncio.sleep(0.2)
+        t = time.monotonic()
+        other = conn.open_stream("POST", "/sink", body=b"s" * 500_000)
+        await asyncio.wait_for(conn.streams[other].done.wait(), 10)
+        took = time.monotonic() - t
+        await asyncio.wait_for(conn.streams[paused].done.wait(), 10)
+        return took, conn.streams.pop(other).resp, conn.streams.pop(paused).resp
+
+    took, other, paused = edge.call(run())
+    assert other.body.startswith(b"500000 ") and took < 0.8, (took, other.body)
+    assert paused.body == b"received 1000000 bytes\n"
+
+
 def test_stream_window(edge, connector):
     """A larger window lets the edge send that much ahead of a paused stream"""
     connector("--stream-window", "262144")

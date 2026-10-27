@@ -21,6 +21,7 @@ import capnp
 import h2.config
 import h2.connection
 import h2.events
+import h2.exceptions
 import hyperframe.frame
 
 SCHEMAS = Path(__file__).parent / "schemas"
@@ -200,18 +201,21 @@ class EdgeConn:
         for sid in list(self.pending):
             data, end = self.pending[sid]
             ended = False
-            while data:
-                n = min(len(data), self.h2.max_outbound_frame_size, self.h2.local_flow_control_window(sid))
-                if n <= 0:
-                    break
-                ended = end and n == len(data)
-                self.h2.send_data(sid, data[:n], end_stream=ended)
-                data = data[n:]
-            if data:
-                self.pending[sid][0] = data
-                continue
-            if end and not ended:
-                self.h2.end_stream(sid)
+            try:
+                while data:
+                    n = min(len(data), self.h2.max_outbound_frame_size, self.h2.local_flow_control_window(sid))
+                    if n <= 0:
+                        break
+                    ended = end and n == len(data)
+                    self.h2.send_data(sid, data[:n], end_stream=ended)
+                    data = data[n:]
+                if data:
+                    self.pending[sid][0] = data
+                    continue
+                if end and not ended:
+                    self.h2.end_stream(sid)
+            except (h2.exceptions.StreamClosedError, h2.exceptions.ProtocolError):
+                pass  # the connector reset or finished the stream
             del self.pending[sid]
         self.flush()
 
@@ -230,6 +234,19 @@ class EdgeConn:
 
     def abort(self):
         self.writer.transport.abort()
+
+    def reset(self, sid, error_code=8):
+        """RST_STREAM (CANCEL by default), as the edge sends when the visitor goes away"""
+        self.pending.pop(sid, None)
+        try:
+            self.h2.reset_stream(sid, error_code)
+        except h2.exceptions.StreamClosedError:
+            return
+        self.flush()
+        if sid in self.streams:
+            self.streams[sid].resp.reset = error_code
+            self.streams[sid].headers_received.set()
+            self.streams[sid].done.set()
 
 
 class _RegistrationServer(tunnelrpc.RegistrationServer.Server):

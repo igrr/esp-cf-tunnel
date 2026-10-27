@@ -11,4 +11,12 @@ menu "Cloudflare Tunnel (esp-cf-tunnel)"
         int "Tunnel task priority"
         default 5
 
+    config CF_TUNNEL_MIN_FREE_HEAP
+        int "Minimum free heap for new requests"
+        default 32768
+        help
+            While less heap than this is free, new requests are answered with
+            503 instead of being served, so that the connections to the edge
+            and the requests in progress keep working. 0 disables the check.
+
 endmenu

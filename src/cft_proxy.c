@@ -19,6 +19,7 @@
 #include "cft_poll.h"
 #include "cft_port.h"
 #include "cft_proxy.h"
+#include "cft_squeue.h"
 
 static const char *TAG = "cft_proxy";
 
@@ -27,6 +28,7 @@ static const char *TAG = "cft_proxy";
 #endif
 
 #define CONNECT_TIMEOUT_MS 30000 /* cloudflared's connectTimeout */
+#define STALL_TIMEOUT_MS 30000   /* origin takes none of the queued request data */
 #define READ_CHUNK 1024
 #define DEFAULT_BUFFER (16 * 1024) /* per direction, see proxy_buffer_size */
 #define MAX_HEAD (16 * 1024)     /* response status line and headers */
@@ -57,23 +59,6 @@ typedef struct {
     size_t off;
 } xbuf_t;
 
-/* Data for the origin, in segments: up to a stream window of it can arrive
- * at once, and one large buffer would need that much contiguous heap. */
-#define SEG_SIZE 4096
-
-typedef struct seg {
-    struct seg *next;
-    size_t len;
-    size_t off;
-    uint8_t data[SEG_SIZE];
-} seg_t;
-
-typedef struct {
-    seg_t *head;
-    seg_t *tail;
-    size_t pending;
-} squeue_t;
-
 typedef struct {
     cft_stream_t *s;
     cft_poll_entry_t *pe;
@@ -84,8 +69,8 @@ typedef struct {
     bool head_request;
     char *host_header;
     /* Request: bytes for the origin */
-    squeue_t up;
-    squeue_t early;     /* body received before the request head was written */
+    cft_squeue_t up;
+    cft_squeue_t early;     /* body received before the request head was written */
     bool head_sent;
     bool chunked_up;
     bool body_ended;
@@ -98,6 +83,7 @@ typedef struct {
     bool reading;
     bool resp_started;
     size_t up_high;   /* pause the request body above this */
+    bool stall_armed; /* deadline set for STALL_TIMEOUT_MS */
     size_t down_high; /* stop reading the origin above this */
 } proxy_t;
 
@@ -134,79 +120,6 @@ static void xbuf_free(xbuf_t *b)
     memset(b, 0, sizeof(*b));
 }
 
-static int sq_append(squeue_t *q, const void *data, size_t len)
-{
-    const uint8_t *d = data;
-    while (len) {
-        if (!q->tail || q->tail->len == SEG_SIZE) {
-            seg_t *sg = malloc(sizeof(*sg));
-            if (!sg) {
-                return -1;
-            }
-            sg->next = NULL;
-            sg->len = sg->off = 0;
-            if (q->tail) {
-                q->tail->next = sg;
-            } else {
-                q->head = sg;
-            }
-            q->tail = sg;
-        }
-        size_t n = SEG_SIZE - q->tail->len < len ? SEG_SIZE - q->tail->len : len;
-        memcpy(q->tail->data + q->tail->len, d, n);
-        q->tail->len += n;
-        q->pending += n;
-        d += n;
-        len -= n;
-    }
-    return 0;
-}
-
-static int sq_printf(squeue_t *q, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
-
-static int sq_printf(squeue_t *q, const char *fmt, ...)
-{
-    char tmp[256];
-    va_list ap;
-    va_start(ap, fmt);
-    int n = vsnprintf(tmp, sizeof(tmp), fmt, ap);
-    va_end(ap);
-    if (n < 0 || n >= (int)sizeof(tmp)) {
-        return -1;
-    }
-    return sq_append(q, tmp, (size_t)n);
-}
-
-/* Drops n bytes from the front */
-static void sq_consume(squeue_t *q, size_t n)
-{
-    q->pending -= n;
-    while (n) {
-        seg_t *sg = q->head;
-        size_t k = sg->len - sg->off < n ? sg->len - sg->off : n;
-        sg->off += k;
-        n -= k;
-        if (sg->off == sg->len) {
-            q->head = sg->next;
-            if (!q->head) {
-                q->tail = NULL;
-            }
-            free(sg);
-        }
-    }
-}
-
-static void sq_free(squeue_t *q)
-{
-    while (q->head) {
-        seg_t *next = q->head->next;
-        free(q->head);
-        q->head = next;
-    }
-    q->tail = NULL;
-    q->pending = 0;
-}
-
 /* --- origin connection --- */
 
 /* Closes the origin side; the stream lives on until on_close */
@@ -220,8 +133,8 @@ static void origin_close(proxy_t *p, bool stream_alive)
         close(p->fd);
         p->fd = -1;
     }
-    sq_free(&p->up);
-    sq_free(&p->early);
+    cft_sq_free(&p->up);
+    cft_sq_free(&p->early);
     xbuf_free(&p->head);
     if (stream_alive) {
         /* Let the rest of the request body come, to be dropped */
@@ -273,8 +186,9 @@ static void finish(proxy_t *p)
 
 static void flush_up(proxy_t *p)
 {
+    bool progressed = false;
     while (p->fd >= 0 && p->up.pending) {
-        seg_t *sg = p->up.head;
+        cft_seg_t *sg = p->up.head;
         ssize_t n = send(p->fd, sg->data + sg->off, sg->len - sg->off, MSG_NOSIGNAL);
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
@@ -283,13 +197,21 @@ static void flush_up(proxy_t *p)
             origin_error(p, strerror(errno));
             return;
         }
-        sq_consume(&p->up, (size_t)n);
+        cft_sq_consume(&p->up, (size_t)n);
+        progressed |= n > 0;
     }
     if (p->fd < 0) {
         return;
     }
     if (p->up.pending == 0) {
         cft_stream_pause_body(p->s, false);
+        cft_poll_deadline(p->pe, 0);
+        p->stall_armed = false;
+    } else if (progressed || !p->stall_armed) {
+        /* An origin that stops reading would hold the visitor's data and
+         * window credit for good; give up on it after a while */
+        cft_poll_deadline(p->pe, cft_port_now_ms() + STALL_TIMEOUT_MS);
+        p->stall_armed = true;
     }
     update_want(p);
 }
@@ -316,27 +238,27 @@ static int add_body(proxy_t *p, const uint8_t *data, size_t len)
         return 0;
     }
     if (!p->chunked_up) {
-        return sq_append(&p->up, data, len);
+        return cft_sq_append(&p->up, data, len);
     }
-    if (sq_printf(&p->up, "%zx\r\n", len) < 0 || sq_append(&p->up, data, len) < 0) {
+    if (cft_sq_printf(&p->up, "%zx\r\n", len) < 0 || cft_sq_append(&p->up, data, len) < 0) {
         return -1;
     }
-    return sq_append(&p->up, "\r\n", 2);
+    return cft_sq_append(&p->up, "\r\n", 2);
 }
 
 static int write_request_head(proxy_t *p)
 {
     const cft_request_t *req = cft_stream_request(p->s);
-    squeue_t *b = &p->up;
-    if (sq_printf(b, "%s ", req->method) < 0 || sq_append(b, req->path, strlen(req->path)) < 0 ||
-            sq_append(b, " HTTP/1.1\r\nHost: ", 17) < 0) {
+    cft_squeue_t *b = &p->up;
+    if (cft_sq_printf(b, "%s ", req->method) < 0 || cft_sq_append(b, req->path, strlen(req->path)) < 0 ||
+            cft_sq_append(b, " HTTP/1.1\r\nHost: ", 17) < 0) {
         return -1;
     }
     const char *host = p->host_header ? p->host_header : req->authority;
-    if (sq_append(b, host, strlen(host)) < 0 || sq_append(b, "\r\n", 2) < 0) {
+    if (cft_sq_append(b, host, strlen(host)) < 0 || cft_sq_append(b, "\r\n", 2) < 0) {
         return -1;
     }
-    if (p->host_header && sq_printf(b, "X-Forwarded-Host: %s\r\n", req->authority) < 0) {
+    if (p->host_header && cft_sq_printf(b, "X-Forwarded-Host: %s\r\n", req->authority) < 0) {
         return -1;
     }
     for (size_t i = 0; i < req->num_headers; i++) {
@@ -344,32 +266,32 @@ static int write_request_head(proxy_t *p)
         if (hop_by_hop(h->name)) {
             continue;
         }
-        if (sq_append(b, h->name, strlen(h->name)) < 0 || sq_append(b, ": ", 2) < 0 ||
-                sq_append(b, h->value, strlen(h->value)) < 0 || sq_append(b, "\r\n", 2) < 0) {
+        if (cft_sq_append(b, h->name, strlen(h->name)) < 0 || cft_sq_append(b, ": ", 2) < 0 ||
+                cft_sq_append(b, h->value, strlen(h->value)) < 0 || cft_sq_append(b, "\r\n", 2) < 0) {
             return -1;
         }
     }
     int rv;
     if (p->upgrade) {
-        rv = sq_printf(b, "Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\r\n");
+        rv = cft_sq_printf(b, "Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\r\n");
     } else if (req->content_length >= 0) {
-        rv = sq_printf(b, "Connection: close\r\nContent-Length: %lld\r\n\r\n", (long long)req->content_length);
+        rv = cft_sq_printf(b, "Connection: close\r\nContent-Length: %lld\r\n\r\n", (long long)req->content_length);
     } else if (p->body_ended && p->early.pending == 0) {
-        rv = sq_printf(b, "Connection: close\r\n\r\n");
+        rv = cft_sq_printf(b, "Connection: close\r\n\r\n");
     } else {
         p->chunked_up = true;
-        rv = sq_printf(b, "Connection: close\r\nTransfer-Encoding: chunked\r\n\r\n");
+        rv = cft_sq_printf(b, "Connection: close\r\nTransfer-Encoding: chunked\r\n\r\n");
     }
     if (rv < 0) {
         return -1;
     }
-    for (seg_t *sg = p->early.head; sg; sg = sg->next) {
+    for (cft_seg_t *sg = p->early.head; sg; sg = sg->next) {
         if (add_body(p, sg->data + sg->off, sg->len - sg->off) < 0) {
             return -1;
         }
     }
-    sq_free(&p->early);
-    if (p->body_ended && p->chunked_up && sq_append(b, "0\r\n\r\n", 5) < 0) {
+    cft_sq_free(&p->early);
+    if (p->body_ended && p->chunked_up && cft_sq_append(b, "0\r\n\r\n", 5) < 0) {
         return -1;
     }
     p->head_sent = true;
@@ -701,6 +623,10 @@ static void on_origin_event(void *arg, unsigned events)
         connected(p);
         return;
     }
+    if (events & CFT_POLL_TIMEOUT) {
+        origin_error(p, "origin stopped taking data");
+        return;
+    }
     if (events & CFT_POLL_WRITE) {
         flush_up(p);
     }
@@ -722,9 +648,9 @@ static void on_body(cft_stream_t *s, void *ctx, const uint8_t *data, size_t len)
         if (p->tcp) {
             return; /* nothing is expected before the WebSocket is accepted */
         }
-        rv = sq_append(&p->early, data, len);
+        rv = cft_sq_append(&p->early, data, len);
     } else if (p->state == P_UPGRADED || p->state == P_TCP) {
-        rv = sq_append(&p->up, data, len);
+        rv = cft_sq_append(&p->up, data, len);
     } else {
         rv = add_body(p, data, len);
     }
@@ -745,7 +671,7 @@ static void on_body_end(cft_stream_t *s, void *ctx)
     proxy_t *p = ctx;
     p->body_ended = true;
     if (p->fd >= 0 && p->head_sent && p->chunked_up && p->state != P_UPGRADED) {
-        if (sq_append(&p->up, "0\r\n\r\n", 5) < 0) {
+        if (cft_sq_append(&p->up, "0\r\n\r\n", 5) < 0) {
             origin_error(p, "out of memory");
             return;
         }
@@ -893,7 +819,7 @@ int cft_proxy_start(cft_stream_t *s, const char *service, const char *host_heade
     cft_poller_t *poller = cfg->poller;
     if (!poller || cft_poller_full(poller)) {
         CFT_LOGW(TAG, "too many origin connections, answering 503");
-        return cft_stream_fail(s, 503);
+        return cft_stream_respond(s, 503, NULL, NULL, 0); /* load shedding, as for too many streams */
     }
     proxy_t *p = calloc(1, sizeof(*p));
     if (!p || (host_header && !(p->host_header = strdup(host_header)))) {
@@ -910,7 +836,7 @@ int cft_proxy_start(cft_stream_t *s, const char *service, const char *host_heade
     p->upgrade = !sc->tcp && req->is_websocket;
     p->head_request = strcmp(req->method, "HEAD") == 0;
     p->state = P_CONNECTING;
-    CFT_LOGI(TAG, "%s %s%s -> %s", req->method, req->authority, req->path, service);
+    CFT_LOGD(TAG, "%s %s%s -> %s", req->method, req->authority, req->path, service);
     if (connect_origin(host, port, &p->fd) < 0 || !(p->pe = cft_poll_add(poller, p->fd, on_origin_event, p))) {
         if (p->fd >= 0) {
             close(p->fd);

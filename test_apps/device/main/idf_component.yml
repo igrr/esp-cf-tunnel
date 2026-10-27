@@ -1,0 +1,5 @@
+dependencies:
+  igrr/esp-cf-tunnel:
+    version: "*"
+    override_path: "../../../"
+  igrr/nvs-dotenv: "^1.0.2"

@@ -36,10 +36,12 @@ set(CORE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../..)
 add_library(cf_tunnel STATIC
     ${CORE_DIR}/src/cft_capnp.c
     ${CORE_DIR}/src/cft_conn.c
+    ${CORE_DIR}/src/cft_debug.c
     ${CORE_DIR}/src/cft_ingress.c
     ${CORE_DIR}/src/cft_poll.c
     ${CORE_DIR}/src/cft_proxy.c
     ${CORE_DIR}/src/cft_rpc.c
+    ${CORE_DIR}/src/cft_squeue.c
     ${CORE_DIR}/src/cft_token.c
     ${CORE_DIR}/src/cft_tunnel.c
     ${CORE_DIR}/src/cft_util.c
@@ -51,8 +53,10 @@ target_link_libraries(cf_tunnel PUBLIC ${NGHTTP2_LIB} OpenSSL::SSL OpenSSL::Cryp
 cft_warnings(cf_tunnel)
 # Short keepalive timers, so tests of dead connections finish quickly
 target_compile_definitions(cf_tunnel PRIVATE CFT_IDLE_PING_MS=1500 CFT_PING_TIMEOUT_MS=1500)
+target_compile_definitions(cf_tunnel PUBLIC CFT_DEBUG_STATS)
 
-add_executable(cft_host main.c)
+add_executable(cft_host main.c ../common/test_handlers.c)
+target_include_directories(cft_host PRIVATE ../common)
 target_link_libraries(cft_host cf_tunnel)
 cft_warnings(cft_host)
 

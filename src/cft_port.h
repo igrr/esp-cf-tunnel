@@ -7,6 +7,7 @@
 #include <stdint.h>
 
 #ifdef ESP_PLATFORM
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
@@ -25,6 +26,14 @@ static inline void cft_port_random(void *buf, size_t len)
 static inline int64_t cft_port_now_ms(void)
 {
     return esp_timer_get_time() / 1000 + 1;
+}
+
+/* New requests get 503 while less heap than this is free */
+#define CFT_MIN_FREE_HEAP CONFIG_CF_TUNNEL_MIN_FREE_HEAP
+
+static inline size_t cft_port_free_heap(void)
+{
+    return heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
 }
 
 #else /* host */
@@ -57,6 +66,18 @@ static inline void cft_port_random(void *buf, size_t len)
         len -= (size_t)n;
     }
 }
+
+#ifndef CFT_MIN_FREE_HEAP
+#define CFT_MIN_FREE_HEAP 0
+#endif
+
+/* Overridable, for testing the low-memory path */
+#ifndef cft_port_free_heap
+static inline size_t cft_port_free_heap(void)
+{
+    return SIZE_MAX;
+}
+#endif
 
 /* Monotonic milliseconds, never 0 */
 static inline int64_t cft_port_now_ms(void)

@@ -68,7 +68,7 @@ esp_err_t cft_tunnel_start(const cft_tunnel_config_t *cfg, cft_tunnel_handle_t *
     if (!c.arch) {
         c.arch = CONFIG_IDF_TARGET;
     }
-    h->tunnel = cft_tunnel_new(&c, &cft_transport_esp_tls);
+    h->tunnel = cft_tunnel_new(&c, &cft_transport_esp);
     if (!h->tunnel) {
         ESP_LOGE(TAG, "invalid tunnel token or out of memory");
         free(h);

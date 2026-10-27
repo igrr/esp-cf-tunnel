@@ -1,6 +1,6 @@
 /**
  * @file cf_tunnel_esp.h
- * @brief ESP-IDF integration: runs a tunnel in a FreeRTOS task over esp-tls.
+ * @brief ESP-IDF integration: runs a tunnel in a FreeRTOS task over mbedTLS.
  *
  * Requires CONFIG_MBEDTLS_SSL_PROTO_TLS1_3 (the edge refuses TLS 1.2).
  */
@@ -13,8 +13,8 @@
 extern "C" {
 #endif
 
-/** @brief Transport over esp-tls, used by cft_tunnel_start() */
-extern const cft_transport_ops_t cft_transport_esp_tls;
+/** @brief Transport over mbedTLS and lwIP sockets, used by cft_tunnel_start() */
+extern const cft_transport_ops_t cft_transport_esp;
 
 /** @brief Handle of a tunnel started by cft_tunnel_start() */
 typedef struct cft_tunnel_esp *cft_tunnel_handle_t;
