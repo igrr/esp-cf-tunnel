@@ -157,6 +157,7 @@ IDF's defaults the bound is lwIP's: `CONFIG_LWIP_TCP_WND_DEFAULT` and
 | `stream_window` | HTTP/2 window per stream, 64 KiB by default: uploads (request bodies) are bounded by it once lwIP's window is larger. 128 KiB about doubled proxied uploads; 256 KiB was a little faster still. |
 | `proxy_buffer_size` | 16 KiB by default; 64 KiB made proxied downloads 10-15 % faster. |
 | `CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN` | 16384 instead of 4096 was not faster, and used 12 KB more. |
+| `CONFIG_LWIP_IRAM_OPTIMIZATION`, `CONFIG_LWIP_EXTRA_IRAM_OPTIMIZATION`, `CONFIG_ETH_IRAM_OPTIMIZATION` | No measurable change. The device is not CPU-bound: during the fastest transfers the tunnel task used at most 72 % of a core (generating the test data included), and each core was idle at least 25 % of the time. |
 
 Measured on the ESP32-P4 over 100 Mbit Ethernet with 5 MB transfers (3 MB
 for proxied uploads), through the production edge from a visitor with
@@ -174,6 +175,14 @@ Frankfurt (fra).
 
 Ranges span repeated runs; the first upload after connecting is the slowest
 (TCP slow start).
+
+Services on other hosts get the same speed as handlers on the device: with
+8 MB transfers to another computer on the LAN, proxied HTTP downloads and
+`cloudflared access tcp` downloads ran at 3.7 MB/s (prg) and 2.0-2.3 MB/s
+(fra), like local downloads, and proxied HTTP uploads at 1.1 and 0.8 MB/s,
+like local uploads. TCP uploads were faster than HTTP uploads, at 2.4 and
+1.9 MB/s. HTTP uploads are bound by `stream_window`: in those runs the tunnel
+task was busy only 9-13 % of the time.
 
 Idle memory does not change with these settings; buffers grow during
 transfers. A larger `stream_window` costs nothing while the receiver keeps
