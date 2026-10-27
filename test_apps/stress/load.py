@@ -352,9 +352,8 @@ class Load:
             await self.stream_get("/lan/big?size=20000000", limit=self.rng.randint(0, 2000000))
         else:
             r = await self.client().get(self.url + "/landead/x")
-            if r.status_code == 503 and not r.content:
-                raise Shed()  # over the origin limit
             if r.status_code != 502:
+                self.classify_error(r.status_code, r.content, r.headers)  # shed or edge errors
                 raise Fail(f"/landead: {r.status_code}")
 
     async def op_tcp(self):
