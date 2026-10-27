@@ -361,3 +361,25 @@ def test_proxy_buffer_size(edge, tunnel, size):
     i = info(edge.request(conn, "POST", "/", [("content-length", str(len(body)))], body,
                           authority="app.example.com"))
     assert i["body_sha"] == hashlib.sha256(body).hexdigest()
+
+
+def test_tcp_over_websocket_visitor_ends(edge, tunnel):
+    """When the visitor's side ends (END_STREAM), the origin sees EOF and the stream ends:
+    an echo origin would otherwise keep the stream and its connection open for good"""
+    conn = tunnel("--max-origins", "1")
+
+    async def session():
+        sid, _ = ws_open(conn, "/", "ssh.example.com")
+        s = conn.streams[sid]
+        await asyncio.wait_for(s.headers_received.wait(), 5)
+        r = WsReader(s)
+        conn.send_body(sid, ws_frame(2, b"bye"))
+        op, payload = await r.frame()
+        conn.send_body(sid, b"", end_stream=True)
+        await asyncio.wait_for(s.done.wait(), 5)
+        return payload
+
+    assert edge.call(session()) == b"bye"
+    # The origin connection was released: the limit of 1 allows another
+    resp = edge.request(conn, "GET", "/", authority="app.example.com")
+    assert resp.status == 200

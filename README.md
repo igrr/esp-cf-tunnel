@@ -167,12 +167,21 @@ What a busy tunnel holds, besides the fixed cost above:
 
 Hardware AES needs memory too: on chips where mbedTLS encrypts large TLS
 records with the AES DMA engine (e.g. the ESP32-P4), every such record
-allocates DMA descriptors, and if the heap is exhausted at that moment the
-TLS connection fails and is re-established, failing its streams. In the
-stress test this happened every few minutes at peak load.
-`CONFIG_MBEDTLS_HARDWARE_AES=n` avoids it at a cost in speed (on the
-ESP32-P4: downloads 0.8 instead of 2.2 MB/s, uploads 0.55 instead of
-0.8 MB/s); otherwise, keep enough headroom with the limits below.
+allocates a few small DMA descriptors in internal RAM, and if internal RAM is
+exhausted at that moment the TLS connection fails and is re-established,
+failing its streams. In the stress test on internal RAM alone this happened
+every few minutes at peak load. Two ways out:
+
+- PSRAM, as `examples/tunnel_ethernet` does: buffers of more than 1 KB,
+  lwIP's and mbedTLS's go to PSRAM, and `CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL`
+  keeps 64 KB of internal RAM for what must be internal (DMA descriptors of
+  the AES and Ethernet drivers). Under the same load, internal RAM never went
+  below 300 KB free and no connection failed; throughput was within 10 % of
+  internal RAM (ESP32-P4: 1.9-2.1 MB/s down, 0.7-0.8 MB/s up);
+- without PSRAM, `CONFIG_MBEDTLS_HARDWARE_AES=n` at a cost in speed
+  (ESP32-P4: 0.8 instead of 2.2 MB/s down, 0.55 instead of 0.8 MB/s up).
+  Turning off only `CONFIG_MBEDTLS_HARDWARE_GCM` does not help with
+  mbedTLS 4 (IDF 6), which still uses the AES DMA engine for GCM.
 
 When memory runs short, new requests get 503 while less than
 `CONFIG_CF_TUNNEL_MIN_FREE_HEAP` is free (32 KiB by default), and a stream
@@ -227,7 +236,8 @@ transfers. A larger `stream_window` costs nothing while the receiver keeps
 up, but a stream whose receiver is slow or paused can hold up to the whole
 window: a proxied upload to a slow host, or a handler using
 `cft_stream_pause_body()`. With `max_origin_connections` uploads at a time,
-that is up to that many windows. `examples/tunnel_ethernet` uses lwIP 32768
+that is up to that many windows. `examples/tunnel_ethernet` uses PSRAM (see
+above), lwIP 32768
 and a 128 KiB window; both are in its `sdkconfig.defaults` and menuconfig.
 
 ## How it works
@@ -354,7 +364,15 @@ LAN host (including origins that fail), and Ethernet outages. It verifies
 every response, separates failures during outages, requests the device sheds
 (503) and errors from the edge itself, and records the device's heap at quiet
 checkpoints, so leaks show as a trend. The device app is built with heap
-poisoning, stack checks and component memory counters.
+poisoning, stack checks and component memory counters; `sdkconfig.psram` adds
+the example's PSRAM settings. `analyze.py` relates the failures to what the
+device logged.
+
+With a macOS host as the TCP origin, a few TCP-over-WebSocket transfers per
+half hour stalled below the component: the device had nothing to read and
+the origin had data queued for it that never arrived. The proxy gives up on
+such a transfer after 30 s and logs the stream's flow-control state. With a
+Linux origin it did not happen.
 
 ```sh
 # on another LAN host

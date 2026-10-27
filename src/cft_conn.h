@@ -92,3 +92,5 @@ const cft_conn_config_t *cft_stream_config(const cft_stream_t *s);
 void cft_stream_set_low_water(cft_stream_t *s, size_t bytes);
 /* The request body is complete */
 bool cft_stream_body_ended(const cft_stream_t *s);
+/* Flow-control state, for diagnostics */
+int cft_stream_describe(const cft_stream_t *s, char *buf, size_t size);

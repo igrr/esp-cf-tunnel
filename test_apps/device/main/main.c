@@ -84,11 +84,14 @@ static int platform_stats(char *buf, size_t size)
     heap_caps_get_info(&info, MALLOC_CAP_DEFAULT);
     return snprintf(buf, size,
                     ",\"uptime_s\":%lld,\"heap_free\":%u,\"heap_min_free\":%u,\"largest_block\":%u,"
-                    "\"alloc_blocks\":%u,\"heap_ok\":%s,\"tunnel_stack_free\":%u,\"netdowns\":%" PRIu32,
+                    "\"alloc_blocks\":%u,\"heap_ok\":%s,\"tunnel_stack_free\":%u,\"netdowns\":%" PRIu32
+                    ",\"internal_free\":%u,\"internal_min_free\":%u",
                     esp_timer_get_time() / 1000000, (unsigned)info.total_free_bytes,
                     (unsigned)info.minimum_free_bytes, (unsigned)info.largest_free_block,
                     (unsigned)info.allocated_blocks, heap_ok() ? "true" : "false",
-                    (unsigned)uxTaskGetStackHighWaterMark(NULL), s_netdowns);
+                    (unsigned)uxTaskGetStackHighWaterMark(NULL), s_netdowns,
+                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                    (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
 }
 
 static void netdown_task(void *arg)

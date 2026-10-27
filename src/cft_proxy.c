@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -84,6 +85,7 @@ typedef struct {
     bool resp_started;
     size_t up_high;   /* pause the request body above this */
     bool stall_armed; /* deadline set for STALL_TIMEOUT_MS */
+    bool shut_wr;     /* the visitor's end was passed on with shutdown() */
     size_t down_high; /* stop reading the origin above this */
 } proxy_t;
 
@@ -184,6 +186,20 @@ static void finish(proxy_t *p)
     origin_close(p, true);
 }
 
+/* Once the visitor has finished sending on a byte stream (TCP over
+ * WebSocket, upgraded HTTP) and all of it reached the origin, pass the end
+ * on, as cloudflared does: the origin sees EOF, closes its side, and the
+ * stream ends with it. Otherwise an origin that waits for more (an echo
+ * server, a shell) would keep the stream and its origin connection open. */
+static void maybe_half_close(proxy_t *p)
+{
+    if (p->body_ended && !p->shut_wr && p->fd >= 0 && p->up.pending == 0 &&
+            (p->state == P_TCP || p->state == P_UPGRADED)) {
+        shutdown(p->fd, SHUT_WR);
+        p->shut_wr = true;
+    }
+}
+
 static void flush_up(proxy_t *p)
 {
     bool progressed = false;
@@ -207,6 +223,7 @@ static void flush_up(proxy_t *p)
         cft_stream_pause_body(p->s, false);
         cft_poll_deadline(p->pe, 0);
         p->stall_armed = false;
+        maybe_half_close(p);
     } else if (progressed || !p->stall_armed) {
         /* An origin that stops reading would hold the visitor's data and
          * window credit for good; give up on it after a while */
@@ -624,6 +641,21 @@ static void on_origin_event(void *arg, unsigned events)
         return;
     }
     if (events & CFT_POLL_TIMEOUT) {
+        char state[160];
+        cft_stream_describe(p->s, state, sizeof(state));
+        /* Is the origin's data there, and does select() say so? */
+        uint8_t byte;
+        ssize_t peek = recv(p->fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+        int peek_errno = errno;
+        fd_set r, w;
+        FD_ZERO(&r);
+        FD_SET(p->fd, &r);
+        w = r;
+        struct timeval tv = {0};
+        int ready = select(p->fd + 1, &r, &w, NULL, &tv);
+        CFT_LOGW(TAG, "%s; to origin %u, %sreading the origin; poll wants %u, select %d (r%d w%d), peek %d errno %d",
+                 state, (unsigned)p->up.pending, p->reading ? "" : "not ", cft_poll_wanted(p->pe), ready,
+                 FD_ISSET(p->fd, &r) ? 1 : 0, FD_ISSET(p->fd, &w) ? 1 : 0, (int)peek, peek_errno);
         origin_error(p, "origin stopped taking data");
         return;
     }
@@ -670,6 +702,10 @@ static void on_body_end(cft_stream_t *s, void *ctx)
 {
     proxy_t *p = ctx;
     p->body_ended = true;
+    if (p->state == P_TCP || p->state == P_UPGRADED) {
+        maybe_half_close(p);
+        return;
+    }
     if (p->fd >= 0 && p->head_sent && p->chunked_up && p->state != P_UPGRADED) {
         if (cft_sq_append(&p->up, "0\r\n\r\n", 5) < 0) {
             origin_error(p, "out of memory");

@@ -528,6 +528,15 @@ bool cft_stream_body_ended(const cft_stream_t *s)
     return s->body_ended;
 }
 
+int cft_stream_describe(const cft_stream_t *s, char *buf, size_t size)
+{
+    nghttp2_session *h2 = s->conn->h2;
+    return snprintf(buf, size, "stream %d: send window %ld (connection %ld), queued %u; receive held %u%s%s",
+                    (int)s->id, (long)nghttp2_session_get_stream_remote_window_size(h2, s->id),
+                    (long)nghttp2_session_get_remote_window_size(h2), (unsigned)s->out.pending, (unsigned)s->held,
+                    s->paused ? ", paused" : "", s->body_ended ? ", visitor done" : "");
+}
+
 /* --- WebSocket --- */
 
 static int ws_send_frame(cft_stream_t *s, uint8_t opcode, const void *data, size_t len)

@@ -32,6 +32,8 @@ bool cft_poller_full(const cft_poller_t *p);
 cft_poll_entry_t *cft_poll_add(cft_poller_t *p, int fd, cft_poll_fn fn, void *arg);
 /* Sets what to wait for (CFT_POLL_READ / CFT_POLL_WRITE) */
 void cft_poll_want(cft_poll_entry_t *e, unsigned events);
+/* What cft_poll_want() set */
+unsigned cft_poll_wanted(const cft_poll_entry_t *e);
 /* Calls fn with CFT_POLL_TIMEOUT at deadline_ms (cft_port_now_ms() time); 0 for none */
 void cft_poll_deadline(cft_poll_entry_t *e, int64_t deadline_ms);
 /* fn is not called again; does not close the socket */

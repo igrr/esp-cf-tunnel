@@ -82,6 +82,11 @@ void cft_poll_want(cft_poll_entry_t *e, unsigned events)
     e->want = events & (CFT_POLL_READ | CFT_POLL_WRITE);
 }
 
+unsigned cft_poll_wanted(const cft_poll_entry_t *e)
+{
+    return e->want;
+}
+
 void cft_poll_deadline(cft_poll_entry_t *e, int64_t deadline_ms)
 {
     e->deadline_ms = deadline_ms;

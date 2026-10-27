@@ -1,4 +1,5 @@
 build/
+build-*/
 *.token
 sdkconfig
 sdkconfig.old
