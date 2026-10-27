@@ -340,11 +340,20 @@ static void pause_end(cft_stream_t *s, void *ctx)
 static void ws_message(cft_stream_t *s, void *ctx, cft_ws_opcode_t op, const uint8_t *data, size_t len)
 {
     atomic_fetch_add(&s_ws_messages, 1);
+#ifdef TH_TRACE_WS
+    printf("ws %p in %u %02x%02x%02x%02x buffered %u\n", (void *)s, (unsigned)len, len > 0 ? data[0] : 0,
+           len > 1 ? data[1] : 0, len > 2 ? data[2] : 0, len > 3 ? data[3] : 0, (unsigned)cft_stream_buffered(s));
+#endif
     if (op == CFT_WS_TEXT && len == 5 && memcmp(data, "close", 5) == 0) {
         cft_ws_close(s, 1000, "bye");
         return;
     }
-    cft_ws_send(s, op, data, len);
+    int rv = cft_ws_send(s, op, data, len);
+#ifdef TH_TRACE_WS
+    printf("ws %p echo %s\n", (void *)s, rv == 0 ? "queued" : "FAILED");
+#else
+    (void)rv;
+#endif
 }
 
 /* /stats */

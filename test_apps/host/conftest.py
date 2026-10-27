@@ -45,11 +45,11 @@ def token_file(tmp_path):
 def connector(edge, token_file, tmp_path):
     procs = []
 
-    def start(*args):
+    def start(*args, env=None):
         log = open(tmp_path / f"connector{len(procs)}.log", "w")
         p = subprocess.Popen([str(BUILD / "cft_host"), "--token-file", str(token_file), "--plain",
                               "--edge", f"127.0.0.1:{edge.port}", "-v", *args],
-                             stdout=log, stderr=subprocess.STDOUT)
+                             stdout=log, stderr=subprocess.STDOUT, env={**os.environ, **(env or {})})
         p.log_path = log.name
         procs.append(p)
         return p

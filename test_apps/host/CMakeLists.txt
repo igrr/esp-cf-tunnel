@@ -54,6 +54,15 @@ cft_warnings(cf_tunnel)
 # Short keepalive timers, so tests of dead connections finish quickly
 target_compile_definitions(cf_tunnel PRIVATE CFT_IDLE_PING_MS=1500 CFT_PING_TIMEOUT_MS=1500)
 target_compile_definitions(cf_tunnel PUBLIC CFT_DEBUG_STATS)
+# Allocation failure injection (fault.c, off unless CFT_FAIL_RATE is set)
+target_sources(cf_tunnel PRIVATE fault.c)
+set_source_files_properties(
+    ${CORE_DIR}/src/cft_capnp.c ${CORE_DIR}/src/cft_conn.c ${CORE_DIR}/src/cft_debug.c
+    ${CORE_DIR}/src/cft_ingress.c ${CORE_DIR}/src/cft_poll.c ${CORE_DIR}/src/cft_proxy.c
+    ${CORE_DIR}/src/cft_rpc.c ${CORE_DIR}/src/cft_squeue.c ${CORE_DIR}/src/cft_token.c
+    ${CORE_DIR}/src/cft_tunnel.c ${CORE_DIR}/src/cft_util.c
+    PROPERTIES COMPILE_DEFINITIONS
+    "malloc=cft_test_malloc;calloc=cft_test_calloc;realloc=cft_test_realloc;strdup=cft_test_strdup")
 
 add_executable(cft_host main.c ../common/test_handlers.c)
 target_include_directories(cft_host PRIVATE ../common)

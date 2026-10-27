@@ -153,15 +153,26 @@ What a busy tunnel holds, besides the fixed cost above:
 - response data waiting for the edge is queued in pieces of at most 4 KB, so
   a large response does not need a large free block; handlers should write
   more from `on_writable` rather than queue everything at once;
-- request data: the edge may send `stream_window` of a request body ahead.
-  While a stream's body is paused (`cft_stream_pause_body()`, or a proxied
-  origin that reads slowly), the connection's window is held back too, so
-  the data held for paused streams is at most `stream_window` + 64 KiB per
-  connection, and one stalled stream cannot stop the others;
+- request data: the edge may send `stream_window` of a request body ahead,
+  so a stream whose body is paused (`cft_stream_pause_body()`, or a proxied
+  origin that reads slowly) can hold up to that much. Only the paused
+  stream waits; the others keep flowing. (Holding back the connection's
+  window as well would bound the total, but a few slow origins would then
+  stall every stream on the connection: the stress test saw WebSocket
+  echoes wait 30 s.);
 - each proxied request also has a socket to the origin: up to
   `proxy_buffer_size` queued in each direction, plus what lwIP has received
   from the origin while the edge is slower, up to `CONFIG_LWIP_TCP_WND_DEFAULT`.
   A proxied upload whose origin takes nothing for 30 s is aborted.
+
+Hardware AES needs memory too: on chips where mbedTLS encrypts large TLS
+records with the AES DMA engine (e.g. the ESP32-P4), every such record
+allocates DMA descriptors, and if the heap is exhausted at that moment the
+TLS connection fails and is re-established, failing its streams. In the
+stress test this happened every few minutes at peak load.
+`CONFIG_MBEDTLS_HARDWARE_AES=n` avoids it at a cost in speed (on the
+ESP32-P4: downloads 0.8 instead of 2.2 MB/s, uploads 0.55 instead of
+0.8 MB/s); otherwise, keep enough headroom with the limits below.
 
 When memory runs short, new requests get 503 while less than
 `CONFIG_CF_TUNNEL_MIN_FREE_HEAP` is free (32 KiB by default), and a stream
@@ -319,7 +330,9 @@ dashboard's public hostnames, proxying to other hosts), `--max-origins N`,
 - `test_chaos.py`: random concurrent operations of every kind for 30 s
   (`CFT_CHAOS_SECONDS` for longer), with visitors that leave mid-transfer and
   connections that are lost, drained or stop answering. At the end, every
-  stream must have been closed.
+  stream must have been closed. A second run makes allocations fail at
+  random (`fault.c`): the connector must survive without leaks or stuck
+  streams and serve normally afterwards.
 
 ```sh
 pip install pytest pycapnp h2

@@ -14,6 +14,8 @@ typedef struct {
     size_t sq_peak;
     size_t streams;   /* streams of all connections */
     size_t held;      /* request data received for paused streams */
+    long send_window_min; /* lowest connection window the edge gave us */
+    unsigned send_window_stalls; /* times it stayed at 0 for over 5 s */
 } cft_debug_t;
 
 extern cft_debug_t cft_debug;

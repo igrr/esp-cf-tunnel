@@ -313,21 +313,42 @@ EXPECTED_CLOSE = {"unregistered", "edge stopped responding", "registration timed
 
 
 def test_chaos(edge, connector, origins):  # noqa: F811
+    run_chaos(edge, connector, origins, DURATION, None)
+
+
+def test_chaos_out_of_memory(edge, connector, origins):  # noqa: F811
+    """The same, with allocations failing at random (fault.c) for the first
+    20 s: no crash, leak or stuck stream, and normal service afterwards"""
+    run_chaos(edge, connector, origins, 35, {"CFT_FAIL_RATE": "0.005", "CFT_FAIL_SECONDS": "20"})
+
+
+def run_chaos(edge, connector, origins, duration, env):  # noqa: F811
     o = origins
-    proc = connector("--ingress", "--connections", "2", "--max-streams", "64", "--max-origins", "8",
+    proc = connector(env=env, *["--ingress", "--connections", "2", "--max-streams", "64", "--max-origins", "8",
               "--posters", "3", "--stream-window", "131072",
               "--lan-http", f"http://{ORIGIN_HOST}:{o['http'].port}",
               "--lan-tcp", f"tcp://{ORIGIN_HOST}:{o['echo'].port}",
-              "--lan-dead", f"http://{ORIGIN_HOST}:{o['closed_port']}")
-    edge.wait_registered(2)
+              "--lan-dead", f"http://{ORIGIN_HOST}:{o['closed_port']}"])
+    edge.wait_registered(1 if env else 2)
     seed = int(os.environ.get("CFT_CHAOS_SEED", str(random.randrange(1 << 30))))
     print("seed", seed)
     chaos = Chaos(edge, random.Random(seed))
     chaos.config = {"ingress": [{"hostname": "test.example.com", "service": "http://localhost:8080"},
                                 {"service": "http_status:404"}]}
-    edge.call(chaos.run(DURATION), timeout=DURATION + 120)
+    edge.call(chaos.run(duration), timeout=duration + 120)
     print(dict(chaos.counts))
-    assert not chaos.failures, "\n".join(chaos.failures[:20])
+    if env:
+        # Failures are expected while allocations fail; now everything must work.
+        # Connections that failed repeatedly may be in their (up to 60 s) backoff.
+        time.sleep(3)
+        edge.wait_registered(1, timeout=75)
+        conn = chaos.live()[0]
+        assert edge.request(conn, "GET", "/hello").status == 200
+        body = os.urandom(300000)
+        r = edge.request(conn, "POST", "/sink", body=body)
+        assert r.body == b"%d %016x\n" % (len(body), fnv(body))
+    else:
+        assert not chaos.failures, "\n".join(chaos.failures[:20])
 
     # Quiet now: every stream the handlers saw must have been closed
     time.sleep(5)  # silent and draining connections close
@@ -341,4 +362,5 @@ def test_chaos(edge, connector, origins):  # noqa: F811
 
     reasons = Counter(re.findall(r"closing connection: (.*)", Path(proc.log_path).read_text(errors="replace")))
     print("connections closed:", dict(reasons))
-    assert set(reasons) <= EXPECTED_CLOSE, reasons
+    if not env:
+        assert set(reasons) <= EXPECTED_CLOSE, reasons

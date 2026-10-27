@@ -273,7 +273,12 @@ class Load:
             for _ in range(self.rng.randint(1, 20)):
                 msg = os.urandom(self.rng.randint(0, 15000))
                 await ws.send(msg)
-                got = await asyncio.wait_for(ws.recv(), 30)
+                try:
+                    got = await asyncio.wait_for(ws.recv(), 30)
+                except asyncio.TimeoutError:
+                    self.log(f"ws stall: sent {len(msg)} bytes {msg[:4].hex()} at "
+                             f"{time.strftime('%H:%M:%S', time.localtime(time.time() - 30))}, no echo")
+                    raise
                 if got != msg:
                     raise Fail("ws echo mismatch")
             end = self.rng.choice(["close", "message", "drop"])

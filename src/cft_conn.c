@@ -115,6 +115,7 @@ struct cft_stream {
     bool want_writable;
     size_t low_water; /* also call on_writable when this little is left queued */
     bool write_failed;
+    uint32_t reset_pending; /* RST_STREAM error code still to queue; 0 = none */
     cft_squeue_t out;
     /* WebSocket */
     bool ws;
@@ -143,6 +144,10 @@ struct cft_conn {
     int64_t last_rx_ms;
     int64_t ping_sent_ms; /* 0 if no PING outstanding */
     bool rx_since_tick;
+    bool resets_pending; /* some stream has reset_pending */
+#ifdef CFT_DEBUG_STATS
+    int64_t window_zero_since; /* the edge's connection window for our data is 0 */
+#endif
     bool alive;
     bool registered;
     bool shutting_down;
@@ -315,6 +320,18 @@ static char *serialize_headers(const cft_header_t *h, size_t n)
     return out;
 }
 
+/* Ends a stream that cannot continue. Queuing the RST_STREAM needs memory
+ * too; if that fails, cft_conn_tick() retries, so the visitor is not left
+ * waiting on a stream nothing will be sent on. */
+static void stream_abort(cft_stream_t *s, uint32_t error_code)
+{
+    s->write_failed = true;
+    if (nghttp2_submit_rst_stream(s->conn->h2, NGHTTP2_FLAG_NONE, s->id, error_code) != 0) {
+        s->reset_pending = error_code;
+        s->conn->resets_pending = true;
+    }
+}
+
 /*
  * Response headers as cloudflared sends them: user headers serialized in one
  * header (so HTTP/2 header rules don't apply to them), content-length also
@@ -330,6 +347,7 @@ static int submit_headers(cft_stream_t *s, int status, const cft_header_t *heade
     snprintf(status_str, sizeof(status_str), "%d", status == 101 ? 200 : status); /* HTTP/2 has no 101 */
     char *serialized = serialize_headers(headers, num_headers);
     if (!serialized) {
+        stream_abort(s, NGHTTP2_INTERNAL_ERROR);
         return -1;
     }
     nghttp2_nv nva[4] = {NV(":status", status_str), NV(HDR_RESP_USER_HEADERS, serialized), NV(HDR_RESP_META, meta)};
@@ -344,6 +362,9 @@ static int submit_headers(cft_stream_t *s, int status, const cft_header_t *heade
     int rv = nghttp2_submit_response2(s->conn->h2, s->id, nva, nnv, &prd);
     free(serialized);
     if (rv != 0) {
+        /* Most likely out of memory; without a response the visitor would wait */
+        CFT_LOGW(TAG, "stream %d: cannot send the response, resetting", (int)s->id);
+        stream_abort(s, NGHTTP2_INTERNAL_ERROR);
         return -1;
     }
     s->resp_started = true;
@@ -359,8 +380,7 @@ static int queue_out(cft_stream_t *s, const void *data, size_t len)
     }
     if (cft_sq_append(&s->out, data, len) < 0) {
         CFT_LOGW(TAG, "stream %d: out of memory, resetting", (int)s->id);
-        s->write_failed = true;
-        nghttp2_submit_rst_stream(s->conn->h2, NGHTTP2_FLAG_NONE, s->id, NGHTTP2_INTERNAL_ERROR);
+        stream_abort(s, NGHTTP2_INTERNAL_ERROR);
         return -1;
     }
     return 0;
@@ -460,14 +480,14 @@ int cft_stream_respond(cft_stream_t *s, int status, const char *content_type, co
 
 void cft_stream_reset(cft_stream_t *s)
 {
-    nghttp2_submit_rst_stream(s->conn->h2, NGHTTP2_FLAG_NONE, s->id, NGHTTP2_CANCEL);
+    stream_abort(s, NGHTTP2_CANCEL);
 }
 
 void cft_stream_pause_body(cft_stream_t *s, bool pause)
 {
     s->paused = pause;
     if (!pause && s->held) {
-        nghttp2_session_consume(s->conn->h2, s->id, s->held);
+        nghttp2_session_consume_stream(s->conn->h2, s->id, s->held);
         CFT_DEBUG_ADD(held, -s->held);
         s->held = 0;
     }
@@ -1014,7 +1034,7 @@ static int on_begin_headers(nghttp2_session *session, const nghttp2_frame *frame
     }
     cft_stream_t *s = calloc(1, sizeof(*s));
     if (!s) {
-        return NGHTTP2_ERR_CALLBACK_FAILURE;
+        return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE; /* resets this stream, not the connection */
     }
     cft_conn_t *c = user_data;
     CFT_DEBUG_ADD(streams, 1);
@@ -1133,8 +1153,10 @@ static int on_data_chunk(nghttp2_session *session, uint8_t flags, int32_t stream
     /* The stream may have been reset, but not freed: that happens in
      * on_stream_close, after this callback. */
     if (s->paused) {
-        /* Data for a paused stream stays in memory until it resumes; the
-         * connection window, as well as the stream's, keeps it bounded. */
+        /* A paused stream gets no more window; the edge can send at most
+         * what it already had. The connection's window is returned, so the
+         * other streams keep flowing. */
+        nghttp2_session_consume_connection(session, len);
         s->held += len;
         CFT_DEBUG_ADD(held, len);
     } else {
@@ -1192,12 +1214,6 @@ static int on_stream_close(nghttp2_session *session, int32_t stream_id, uint32_t
         return 0;
     }
     nghttp2_session_set_stream_user_data(session, stream_id, NULL);
-    if (s->held) {
-        /* Return what the stream held to the connection window */
-        nghttp2_session_consume_connection(session, s->held);
-        CFT_DEBUG_ADD(held, -s->held);
-        s->held = 0;
-    }
     if (s == c->control) {
         c->control = NULL;
         conn_fail(c, "control stream closed by edge");
@@ -1332,9 +1348,9 @@ cft_conn_t *cft_conn_new(const cft_conn_config_t *cfg)
         };
     }
     nghttp2_submit_settings(c->h2, NGHTTP2_FLAG_NONE, iv, niv);
-    /* The connection window bounds the data held for paused streams (see
-     * on_data_chunk). One stream's window more than a stream can hold, so a
-     * single stalled stream does not stop the others. */
+    /* Received data is returned to the connection window right away (see
+     * on_data_chunk); a little more than a stream's window keeps one stream
+     * from using it all up while its data is in flight. */
     uint32_t conn_window = window + NGHTTP2_INITIAL_WINDOW_SIZE;
     if (conn_window > (uint32_t)NGHTTP2_MAX_WINDOW_SIZE) {
         conn_window = NGHTTP2_MAX_WINDOW_SIZE;
@@ -1468,6 +1484,18 @@ void cft_conn_tick(cft_conn_t *c, int64_t now_ms)
         c->created_ms = now_ms;
         c->last_rx_ms = now_ms;
     }
+    if (c->resets_pending) {
+        c->resets_pending = false;
+        for (cft_stream_t *s = c->streams; s; s = s->next) {
+            if (s->reset_pending) {
+                if (nghttp2_submit_rst_stream(c->h2, NGHTTP2_FLAG_NONE, s->id, s->reset_pending) == 0) {
+                    s->reset_pending = 0;
+                } else {
+                    c->resets_pending = true;
+                }
+            }
+        }
+    }
     if (c->rx_since_tick) {
         c->rx_since_tick = false;
         c->last_rx_ms = now_ms;
@@ -1477,6 +1505,22 @@ void cft_conn_tick(cft_conn_t *c, int64_t now_ms)
         conn_fail(c, "registration timed out");
         return;
     }
+#ifdef CFT_DEBUG_STATS
+    long win = (long)nghttp2_session_get_remote_window_size(c->h2);
+    if (win < cft_debug.send_window_min || cft_debug.send_window_min == 0) {
+        cft_debug.send_window_min = win;
+    }
+    if (win > 0) {
+        c->window_zero_since = 0;
+    } else if (!c->window_zero_since) {
+        c->window_zero_since = now_ms;
+    } else if (now_ms - c->window_zero_since > 5000) {
+        CFT_LOGW(TAG, "connection %u: no window from the edge for %lld ms", c->cfg.conn_index,
+                 (long long)(now_ms - c->window_zero_since));
+        cft_debug.send_window_stalls++;
+        c->window_zero_since = now_ms;
+    }
+#endif
     if (c->ping_sent_ms) {
         if (now_ms - c->ping_sent_ms > CFT_PING_TIMEOUT_MS) {
             conn_fail(c, "edge stopped responding");
