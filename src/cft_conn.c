@@ -41,6 +41,8 @@ static const char *TAG = "cft_conn";
 #endif
 #define REGISTER_TIMEOUT_MS 15000
 #define DEFAULT_MAX_BODY (16 * 1024)
+/* Request header block limit; over it the request is answered with 431 */
+#define MAX_HEADER_BLOCK (16 * 1024)
 
 static const char *const default_features[] = {
     "serialized_headers",
@@ -88,6 +90,7 @@ struct cft_stream {
      * buffer (kind 0: regular header; pseudo-headers have no name), indexed
      * once the headers are complete: two allocations per request. */
     buf_t hdrbuf;
+    bool hdr_too_large; /* header block exceeded MAX_HEADER_BLOCK */
     size_t num_headers;
     cft_header_t *headers;
     const char *pseudo[5]; /* indexed by kind */
@@ -293,11 +296,53 @@ static void resume(cft_stream_t *s)
 
 #define NV(n, v) {(uint8_t *)(n), (uint8_t *)(v), strlen(n), strlen(v), NGHTTP2_NV_FLAG_NONE}
 
-/* "b64(name):b64(value);..." with unpadded standard base64 */
+/* RFC 7230 token character */
+static bool token_char(char c)
+{
+    return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+           strchr("!#$%&'*+-.^_`|~", c) != NULL;
+}
+
+/* No bytes that could break the edge's response framing: control characters
+ * other than tab, including CR and LF, and DEL */
+static bool valid_header_value(const char *v)
+{
+    if (!v) {
+        return false;
+    }
+    for (const unsigned char *p = (const unsigned char *)v; *p; p++) {
+        if ((*p < ' ' && *p != '\t') || *p == 0x7f) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* A header safe to forward: a token name and a value without control
+ * characters. The edge would refuse anything else, taking down the whole
+ * connection. */
+static bool valid_header(const cft_header_t *h)
+{
+    if (!h->name || !h->name[0] || !valid_header_value(h->value)) {
+        return false;
+    }
+    for (const char *p = h->name; *p; p++) {
+        if (!token_char(*p)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* "b64(name):b64(value);..." with unpadded standard base64. Invalid entries
+ * are skipped with a warning. */
 static char *serialize_headers(const cft_header_t *h, size_t n)
 {
     size_t len = 1;
     for (size_t i = 0; i < n; i++) {
+        if (!valid_header(&h[i])) {
+            continue;
+        }
         len += cft_b64_raw_len(strlen(h[i].name)) + cft_b64_raw_len(strlen(h[i].value)) + 2;
     }
     char *out = malloc(len);
@@ -306,7 +351,11 @@ static char *serialize_headers(const cft_header_t *h, size_t n)
     }
     char *p = out;
     for (size_t i = 0; i < n; i++) {
-        if (i) {
+        if (!valid_header(&h[i])) {
+            CFT_LOGW(TAG, "not forwarding header %s", h[i].name ? h[i].name : "(null)");
+            continue;
+        }
+        if (p != out) {
             *p++ = ';';
         }
         size_t nl = strlen(h[i].name);
@@ -353,8 +402,22 @@ static int submit_headers(cft_stream_t *s, int status, const cft_header_t *heade
     nghttp2_nv nva[4] = {NV(":status", status_str), NV(HDR_RESP_USER_HEADERS, serialized), NV(HDR_RESP_META, meta)};
     size_t nnv = 3;
     for (size_t i = 0; i < num_headers; i++) {
-        if (strcasecmp(headers[i].name, "content-length") == 0) {
-            nva[nnv++] = (nghttp2_nv)NV("content-length", headers[i].value);
+        if (headers[i].name && strcasecmp(headers[i].name, "content-length") == 0) {
+            /* Forwarded as a real header, not serialized: digits only, or
+             * the edge refuses the whole response */
+            const char *v = headers[i].value;
+            bool digits = v && v[0];
+            for (const char *p = v; p && *p; p++) {
+                if (*p < '0' || *p > '9') {
+                    digits = false;
+                    break;
+                }
+            }
+            if (digits) {
+                nva[nnv++] = (nghttp2_nv)NV("content-length", v);
+                break;
+            }
+            CFT_LOGW(TAG, "not forwarding content-length: %s", v ? v : "(null)");
             break;
         }
     }
@@ -684,6 +747,16 @@ static void ws_feed(cft_stream_t *s, const uint8_t *data, size_t len)
             /* Header complete */
             w->fin = w->hdr[0] & 0x80;
             w->opcode = w->hdr[0] & 0x0f;
+            if (w->hdr[0] & 0x70) {
+                ws_fail(s, 1002, "reserved bits set");
+                return;
+            }
+            bool control = w->opcode & 0x08;
+            if (!(w->opcode == CFT_WS_TEXT || w->opcode == CFT_WS_BINARY || w->opcode == 0 ||
+                    (control && (w->opcode == CFT_WS_CLOSE || w->opcode == CFT_WS_PING || w->opcode == CFT_WS_PONG)))) {
+                ws_fail(s, 1002, "reserved opcode");
+                return;
+            }
             uint8_t l7 = w->hdr[1] & 0x7f;
             size_t pos = 2;
             uint64_t plen = l7;
@@ -704,7 +777,6 @@ static void ws_feed(cft_stream_t *s, const uint8_t *data, size_t len)
                 return;
             }
             memcpy(w->mask, w->hdr + pos, 4);
-            bool control = w->opcode & 0x08;
             if (control && (plen > 125 || !w->fin)) {
                 ws_fail(s, 1002, "invalid control frame");
                 return;
@@ -891,9 +963,13 @@ static void handle_config(cft_conn_t *c, cft_stream_t *s)
     char reply[96];
     int n = snprintf(reply, sizeof(reply), "{\"lastAppliedVersion\":%ld,\"err\":%s}", (long)c->config_version,
                      ok ? "null" : "\"malformed configuration\"");
+    if (cft_sq_append(&s->out, reply, (size_t)n) < 0) {
+        /* Out of memory: refuse rather than confirm an unapplied version */
+        respond_full(s, 500, NULL, NULL, 0, META_CLOUDFLARED);
+        return;
+    }
     /* Plain response, as cloudflared's ResponseWriter writes it */
     nghttp2_nv nva[] = {NV(":status", "200"), NV("content-type", "application/json")};
-    cft_sq_append(&s->out, reply, (size_t)n);
     s->resp_end = true;
     s->resp_started = true;
     nghttp2_data_provider2 prd = {.source.ptr = s, .read_callback = read_out};
@@ -905,6 +981,14 @@ enum { HDR_REGULAR, HDR_METHOD, HDR_PATH, HDR_AUTHORITY, HDR_SCHEME };
 static int hdr_store(cft_stream_t *s, uint8_t kind, const uint8_t *name, size_t namelen, const uint8_t *value,
                      size_t valuelen)
 {
+    if (s->hdr_too_large) {
+        return 0; /* already over the limit; drop the rest */
+    }
+    if (s->hdrbuf.len + valuelen + namelen + 3 > MAX_HEADER_BLOCK) {
+        CFT_LOGW(TAG, "stream %d: header block too large", (int)s->id);
+        s->hdr_too_large = true;
+        return 0;
+    }
     static const uint8_t nul = 0;
     buf_t *b = &s->hdrbuf;
     if (buf_append(b, &kind, 1) < 0 ||
@@ -918,7 +1002,8 @@ static int hdr_store(cft_stream_t *s, uint8_t kind, const uint8_t *name, size_t 
     return 0;
 }
 
-/* Indexes the stored fields; returns -1 if out of memory */
+/* Indexes the stored fields; returns -1 if out of memory or the records
+ * desynchronized (which cannot happen for validated headers) */
 static int build_request(cft_stream_t *s)
 {
     buf_t *b = &s->hdrbuf;
@@ -936,13 +1021,22 @@ static int build_request(cft_stream_t *s)
     for (const char *p = (const char *)b->p, *end = p + b->len; p < end;) {
         uint8_t kind = (uint8_t)p[0];
         p++;
+        if (kind > HDR_SCHEME) {
+            goto bad;
+        }
         const char *name = NULL;
         if (kind == HDR_REGULAR) {
             name = p;
-            p += strlen(p) + 1;
+            p += strnlen(p, (size_t)(end - p)) + 1;
+            if (p > end) {
+                goto bad;
+            }
         }
         const char *value = p;
-        p += strlen(p) + 1;
+        p += strnlen(p, (size_t)(end - p)) + 1;
+        if (p > end) {
+            goto bad;
+        }
         if (kind == HDR_REGULAR) {
             s->headers[n].name = name;
             s->headers[n].value = value;
@@ -950,6 +1044,9 @@ static int build_request(cft_stream_t *s)
         } else {
             s->pseudo[kind] = value;
         }
+    }
+    if (n != s->num_headers) {
+        goto bad;
     }
     s->req = (cft_request_t) {
         .method = s->pseudo[HDR_METHOD] ? s->pseudo[HDR_METHOD] : "",
@@ -967,6 +1064,9 @@ static int build_request(cft_stream_t *s)
         s->req.content_length = strtoll(cl, NULL, 10);
     }
     return 0;
+bad:
+    CFT_LOGE(TAG, "stream %d: header records desynchronized", (int)s->id);
+    return -1;
 }
 
 /* Headers complete (END_HEADERS) */
@@ -985,6 +1085,10 @@ static void on_request_headers(cft_conn_t *c, cft_stream_t *s)
         return;
     case STREAM_HTTP:
         break;
+    }
+    if (s->hdr_too_large) {
+        respond_full(s, 431, NULL, NULL, 0, META_ORIGIN);
+        return;
     }
     if (build_request(s) < 0) {
         respond_full(s, 503, NULL, NULL, 0, META_ORIGIN);

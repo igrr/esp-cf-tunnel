@@ -375,8 +375,8 @@ cft_tunnel_t *cft_tunnel_new(const cft_tunnel_config_t *cfg, const cft_transport
     }
     t->tr = *transport;
     if (!cfg->edge_hosts[0]) {
-        t->cfg.edge_hosts[0] = CFT_EDGE_REGION1;
-        t->cfg.edge_hosts[1] = CFT_EDGE_REGION2;
+        t->cfg.edge_hosts[0] = cfg->edge_hosts[1] ? cfg->edge_hosts[1] : CFT_EDGE_REGION1;
+        t->cfg.edge_hosts[1] = cfg->edge_hosts[1] ? cfg->edge_hosts[1] : CFT_EDGE_REGION2;
     } else if (!cfg->edge_hosts[1]) {
         t->cfg.edge_hosts[1] = cfg->edge_hosts[0];
     }

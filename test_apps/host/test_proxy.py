@@ -383,3 +383,90 @@ def test_tcp_over_websocket_visitor_ends(edge, tunnel):
     # The origin connection was released: the limit of 1 allows another
     resp = edge.request(conn, "GET", "/", authority="app.example.com")
     assert resp.status == 200
+
+
+# --- hostile or broken origins ---
+
+class _HostileHandler(socketserver.StreamRequestHandler):
+    """Sends one fixed response that must not be forwarded as-is to the visitor"""
+
+    def handle(self):
+        self.rfile.readline()
+        while self.rfile.readline() not in (b"\r\n", b"\n", b""):
+            pass
+        self.wfile.write(self.server.response)
+
+
+class _HostileServer(_Server):
+    def __init__(self, response):
+        self.response = response
+        super().__init__(_HostileHandler)
+
+
+HOSTILE_RESPONSES = [
+    # Embedded CR inside a header value: must not reach the visitor
+    b"HTTP/1.1 200 OK\r\nX-Evil: a\rInjected: 1\r\nContent-Length: 2\r\n\r\nhi",
+    # Content-Length is not a plain number
+    b"HTTP/1.1 200 OK\r\nContent-Length: 5;evil\r\n\r\nhello",
+    # Negative Content-Length
+    b"HTTP/1.1 200 OK\r\nContent-Length: -1\r\n\r\nhello",
+    # Two different Content-Length values
+    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 20\r\n\r\nhi",
+    # A control character in the header name
+    b"HTTP/1.1 200 OK\r\nX Ev\x01il: v\r\nContent-Length: 0\r\n\r\n",
+]
+
+
+@pytest.mark.parametrize("response", HOSTILE_RESPONSES)
+def test_proxy_hostile_origin(edge, tunnel, response):
+    """A hostile origin neither breaks the edge connection nor smuggles headers"""
+    hostile = _HostileServer(response)
+    try:
+        conn = tunnel()
+        rules = [{"hostname": "h.example.com", "service": f"http://{ORIGIN_HOST}:{hostile.port}"}]
+        edge.push_config(conn, 2, {"ingress": rules, "warp-routing": {"enabled": False}})
+        resp = edge.request(conn, "GET", "/", authority="h.example.com")
+        if b"X-Evil" in response:
+            # The CR header is dropped; the response itself is fine
+            assert resp.status == 200 and resp.body == b"hi"
+            assert "x-evil" not in resp.user_headers and "injected" not in resp.user_headers
+            assert resp.user_headers.get("content-length") == "2"
+        elif b"X Ev" in response:
+            assert resp.status == 200
+            assert all("evil" not in name for name in resp.user_headers)
+        else:
+            # Broken Content-Length: refused, as Go's HTTP client would
+            assert resp.status == 502
+        # The edge connection survived all of that (routed to the local handler)
+        assert edge.request(conn, "GET", "/", authority="app.example.com").status == 200
+    finally:
+        hostile.release.set()
+        hostile.shutdown()
+        hostile.server_close()
+
+
+def test_proxy_utf8_header(edge, tunnel):
+    """Header values with bytes above 0x7f (UTF-8) are forwarded, not mistaken for control characters"""
+    value = "attachment; filename=\"café.txt\""
+    origin = _HostileServer(b"HTTP/1.1 200 OK\r\nContent-Disposition: " + value.encode() +
+                            b"\r\nContent-Length: 2\r\n\r\nhi")
+    try:
+        conn = tunnel()
+        rules = [{"hostname": "h.example.com", "service": f"http://{ORIGIN_HOST}:{origin.port}"}]
+        edge.push_config(conn, 2, {"ingress": rules, "warp-routing": {"enabled": False}})
+        resp = edge.request(conn, "GET", "/", authority="h.example.com")
+        assert resp.status == 200 and resp.body == b"hi"
+        assert resp.user_headers.get("content-disposition") == value
+    finally:
+        origin.release.set()
+        origin.shutdown()
+        origin.server_close()
+
+
+@pytest.mark.parametrize("service", ["http_status:99", "http_status:99999999999", "http_status:418abc", "bogus://x"])
+def test_proxy_bad_service(edge, tunnel, service):
+    """Services that cannot be served at all answer 502, not silence"""
+    conn = tunnel()
+    edge.push_config(conn, 2, {"ingress": [{"service": service}], "warp-routing": {"enabled": False}})
+    resp = edge.request(conn, "GET", "/", authority="whatever.example.com")
+    assert resp.status == 502

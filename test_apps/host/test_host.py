@@ -352,3 +352,64 @@ def test_websocket_message_limit(edge, connector):
 
     op, payload = edge.call(session())
     assert op == 8 and int.from_bytes(payload[:2], "big") == 1009
+
+
+# --- input validation of data from the edge ---
+
+def test_config_version_overflow(edge, connector):
+    """A configuration version that does not fit in int64 is refused, not applied"""
+    connector("--ingress")
+    [conn] = edge.wait_registered()
+    config = {"ingress": [{"service": "http_status:418"}]}
+    resp, reply = edge.push_config(conn, 99999999999999999999, config)
+    assert reply == {"lastAppliedVersion": 0, "err": "malformed configuration"}
+    # Not applied: requests are still served locally
+    assert b"Hello from" in edge.request(conn, "GET", "/").body
+    # A normal version still applies afterwards
+    resp, reply = edge.push_config(conn, 1, config)
+    assert reply == {"lastAppliedVersion": 1, "err": None}
+    assert edge.request(conn, "GET", "/").status == 418
+
+
+def test_request_header_block_limit(edge, connector):
+    """A request with an oversized header block is answered with 431"""
+    connector()
+    [conn] = edge.wait_registered()
+    resp = edge.request(conn, "GET", "/", [("x-big", "a" * 20000)])
+    assert resp.status == 431
+    # The connection still works
+    assert b"Hello from" in edge.request(conn, "GET", "/").body
+
+
+def test_websocket_reserved_bits(edge, connector):
+    connector()
+    [conn] = edge.wait_registered()
+
+    async def session():
+        sid, _ = ws_open(conn)
+        s = conn.streams[sid]
+        await asyncio.wait_for(s.headers_received.wait(), 5)
+        r = WsReader(s)
+        # RSV1 set, a reserved opcode and a fragmented control frame are all protocol errors
+        conn.send_body(sid, bytes([0xc1, 0x82]) + b"\x01\x02\x03\x04" + b"hi")
+        return await r.frame()
+
+    op, payload = edge.call(session())
+    assert op == 8 and int.from_bytes(payload[:2], "big") == 1002
+
+
+def test_websocket_reserved_opcode(edge, connector):
+    connector()
+    [conn] = edge.wait_registered()
+
+    async def session():
+        sid, _ = ws_open(conn)
+        s = conn.streams[sid]
+        await asyncio.wait_for(s.headers_received.wait(), 5)
+        r = WsReader(s)
+        # Opcode 0x3 is reserved
+        conn.send_body(sid, bytes([0x83, 0x82]) + b"\x01\x02\x03\x04" + b"hi")
+        return await r.frame()
+
+    op, payload = edge.call(session())
+    assert op == 8 and int.from_bytes(payload[:2], "big") == 1002

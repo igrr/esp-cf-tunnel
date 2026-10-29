@@ -408,7 +408,7 @@ int cft_rpc_feed(cft_rpc_t *rpc, const uint8_t *data, size_t len)
     if (rpc->state == ST_FAILED) {
         return -1;
     }
-    if (rpc->rx_len + len > RX_MAX) {
+    if (len > RX_MAX - rpc->rx_len) {
         emit_protocol_error(rpc, "RPC message too large%s", NULL);
         return -1;
     }

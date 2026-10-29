@@ -128,6 +128,11 @@ int cft_stream_read_body(cft_stream_t *s, size_t max_len,
  * Follow with cft_stream_write() and cft_stream_end(). Include
  * content-length if known; otherwise the edge sends the body chunked.
  *
+ * Headers that could break the response framing are not forwarded: names
+ * must be HTTP tokens, values must not contain control characters (CR, LF,
+ * NUL), and content-length must be a plain decimal number. Invalid entries
+ * are skipped with a warning.
+ *
  * @param s  Stream
  * @param status  HTTP status
  * @param headers  Response headers; copied

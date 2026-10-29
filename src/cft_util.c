@@ -250,7 +250,11 @@ bool cft_json_get_int(const char *json, size_t len, const char *key, int64_t *ou
     }
     int64_t v = 0;
     while (c.p < c.end && *c.p >= '0' && *c.p <= '9') {
-        v = v * 10 + (*c.p - '0');
+        int64_t d = *c.p - '0';
+        if (v > (INT64_MAX - d) / 10) {
+            return false; /* does not fit: not a value we can use */
+        }
+        v = v * 10 + d;
         c.p++;
     }
     *out = neg ? -v : v;

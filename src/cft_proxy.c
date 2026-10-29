@@ -342,6 +342,23 @@ static bool ends_with_chunked(const char *v)
     return n >= 7 && strcasecmp(v + n - 7, "chunked") == 0;
 }
 
+/* Content-Length as Go's http client requires it: digits only, no overflow.
+ * Anything else means the origin is broken or hostile. */
+static bool parse_content_length(const char *v, int64_t *out)
+{
+    if (!v || !v[0]) {
+        return false;
+    }
+    errno = 0;
+    char *end;
+    long long n = strtoll(v, &end, 10);
+    if (*end != '\0' || errno == ERANGE || n < 0) {
+        return false;
+    }
+    *out = (int64_t)n;
+    return true;
+}
+
 static char *trim(char *s, char *end)
 {
     while (s < end && (*s == ' ' || *s == '\t')) {
@@ -376,6 +393,7 @@ static bool start_response(proxy_t *p)
     cft_header_t hdrs[MAX_RESP_HEADERS];
     size_t n = 0;
     int64_t content_length = -1;
+    bool have_cl = false;
     bool chunked = false;
     char *line = eol ? line_end + 1 : line_end;
     while (*line) {
@@ -386,12 +404,23 @@ static bool start_response(proxy_t *p)
             *colon = '\0';
             char *name = trim(line, colon);
             char *value = trim(colon + 1, line_end);
-            if (strcasecmp(name, "content-length") == 0) {
-                content_length = strtoll(value, NULL, 10);
+            bool is_cl = strcasecmp(name, "content-length") == 0;
+            if (is_cl) {
+                int64_t cl;
+                if (!parse_content_length(value, &cl) || (have_cl && cl != content_length)) {
+                    origin_error(p, "malformed Content-Length");
+                    return true;
+                }
+                if (!have_cl) {
+                    have_cl = true;
+                    content_length = cl;
+                } else {
+                    is_cl = false; /* duplicate: forward it only once */
+                }
             } else if (strcasecmp(name, "transfer-encoding") == 0 && ends_with_chunked(value)) {
                 chunked = true;
             }
-            if (n < MAX_RESP_HEADERS && forwarded_response_header(name, status == 101)) {
+            if (n < MAX_RESP_HEADERS && (is_cl || forwarded_response_header(name, status == 101))) {
                 hdrs[n].name = name;
                 hdrs[n].value = value;
                 n++;
@@ -822,11 +851,12 @@ int cft_proxy_start(cft_stream_t *s, const char *service, const char *host_heade
         return cft_stream_fail(s, 500);
     }
     if (strncmp(service, "http_status:", 12) == 0) {
-        int code = atoi(service + 12);
-        if (code < 100 || code > 999) {
+        char *end;
+        long code = strtol(service + 12, &end, 10);
+        if (*end != '\0' || code < 100 || code > 999) {
             return -1;
         }
-        return cft_stream_respond(s, code, NULL, NULL, 0);
+        return cft_stream_respond(s, (int)code, NULL, NULL, 0);
     }
     const scheme_t *sc = NULL;
     const char *rest = strstr(service, "://");

@@ -410,6 +410,8 @@ int cft_stream_send_headers (
 
 Follow with [**cft\_stream\_write()**](#function-cft_stream_write)and[**cft\_stream\_end()**](#function-cft_stream_end). Include content-length if known; otherwise the edge sends the body chunked.
 
+Headers that could break the response framing are not forwarded: names must be HTTP tokens, values must not contain control characters (CR, LF, NUL), and content-length must be a plain decimal number. Invalid entries are skipped with a warning.
+
 
 
 **Parameters:**
