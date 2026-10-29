@@ -7,7 +7,7 @@
  * open. Each request arrives as a cft_stream_t on the tunnel's thread. On
  * ESP-IDF, use cf_tunnel_esp.h, which runs the tunnel in a task.
  *
- * Requests can also be passed on to other hosts, like cloudflared does:
+ * Requests can also be forwarded to other hosts, as cloudflared does:
  * see cft_tunnel_config_t.use_ingress_rules and cft_stream_proxy().
  *
  * All functions except cft_tunnel_post() and cft_tunnel_request_stop() must
@@ -64,14 +64,14 @@ typedef struct {
     void (*on_body)(cft_stream_t *s, void *ctx, const uint8_t *data, size_t len);
     /** The request body is complete (also called for requests without a body) */
     void (*on_body_end)(cft_stream_t *s, void *ctx);
-    /** Everything written so far has been passed on; write more now */
+    /** All queued response data has been handed to the HTTP/2 session; write the next chunk now */
     void (*on_writable)(cft_stream_t *s, void *ctx);
     /** A complete WebSocket text or binary message (after cft_ws_accept()) */
     void (*on_ws_message)(cft_stream_t *s, void *ctx, cft_ws_opcode_t opcode, const uint8_t *data, size_t len);
     /**
-     * The stream is gone: the response was sent, or the visitor or the
-     * connection went away. The stream must not be used afterwards; free ctx
-     * here. completed is true if the whole response was sent.
+     * The stream has closed: the response completed, the visitor disconnected,
+     * or the connection closed. The stream must not be used afterwards; free ctx
+     * here. completed is true if the full response was sent.
      */
     void (*on_close)(cft_stream_t *s, void *ctx, bool completed);
 } cft_stream_handlers_t;
@@ -82,7 +82,7 @@ typedef struct {
  * Respond right away (cft_stream_respond()), read the body
  * (cft_stream_read_body()), accept a WebSocket (cft_ws_accept()), or set
  * handlers (cft_stream_set_handlers()) and respond later. A stream with no
- * response stays open until the visitor gives up.
+ * response stays open until the visitor disconnects.
  */
 typedef void (*cft_request_fn)(void *arg, cft_stream_t *s, const cft_request_t *req);
 
@@ -139,8 +139,7 @@ int cft_stream_send_headers(cft_stream_t *s, int status, const cft_header_t *hea
 /**
  * @brief Queues response body data
  *
- * The data is copied. To limit memory use, write more from on_writable
- * rather than all at once.
+ * The data is copied. To limit memory usage, write chunks from on_writable.
  *
  * @return 0 on success, -1 on error
  */
@@ -172,33 +171,34 @@ int cft_stream_respond(cft_stream_t *s, int status, const char *content_type, co
 void cft_stream_reset(cft_stream_t *s);
 
 /**
- * @brief Stops or resumes the flow of request body data
+ * @brief Pauses or resumes incoming request body data
  *
- * While paused, the edge can still send what it was already allowed to (up
- * to 64 KiB per stream), which on_body receives as usual; then it waits.
- * Use it when the body goes somewhere slower than the network, e.g. flash.
+ * While paused, the edge can still send up to the remaining stream window
+ * (cft_tunnel_config_t.stream_window, 64 KiB by default), which on_body
+ * receives as usual before the stream stops. Use this when the consumer is
+ * slower than the network, e.g. when writing to flash.
  *
  * @param s  Stream
- * @param pause  true to stop, false to resume
+ * @param pause  true to pause, false to resume
  */
 void cft_stream_pause_body(cft_stream_t *s, bool pause);
 
 /**
- * @brief Passes the request on to another host, as cloudflared does
+ * @brief Forwards the request to another host, as cloudflared does
  *
  * Services:
- * - http://host[:port], ws://host[:port]: HTTP/1.1 proxy, WebSockets included;
- * - ssh://, rdp://, smb://, tcp://host[:port]: TCP over WebSocket, the form
- *   `cloudflared access` uses on the visitor's side;
+ * - http://host[:port], ws://host[:port]: HTTP/1.1 proxy, including WebSockets;
+ * - ssh://, rdp://, smb://, tcp://host[:port]: TCP over WebSocket, used with
+ *   `cloudflared access` on the client side;
  * - http_status:CODE: an empty response with that status.
  *
- * Not supported: https:// and wss:// origins, unix sockets, and cloudflared's
+ * Unsupported: https:// and wss:// origins, Unix sockets, and cloudflared's
  * built-in services (hello_world, bastion, socks5).
  *
- * Each request gets its own connection to the origin. The tunnel then owns
- * the stream; do not set handlers. If the origin cannot be reached, the
- * visitor gets 502; over max_origin_connections, 503. Resolving a host name
- * blocks the tunnel's thread; IP addresses do not.
+ * Each request opens a separate connection to the origin. The tunnel takes
+ * ownership of the stream; do not set handlers on it. If the origin cannot be
+ * reached, the visitor receives 502; above max_origin_connections, 503.
+ * Resolving a hostname blocks the tunnel thread; IP addresses do not.
  *
  * @param s  Stream, from on_request
  * @param service  Service URL; copied
@@ -244,7 +244,7 @@ typedef enum {
     CFT_EVENT_REGISTERED,          /*!< Connection is registered and serving */
     CFT_EVENT_REGISTRATION_FAILED, /*!< The edge refused the connection */
     CFT_EVENT_CONFIG_UPDATED,      /*!< The edge pushed the remote configuration */
-    CFT_EVENT_DRAINING,            /*!< The edge asked to move off this connection */
+    CFT_EVENT_DRAINING,            /*!< The edge is draining this connection */
     CFT_EVENT_UNREGISTERED,        /*!< Graceful shutdown acknowledged */
     CFT_EVENT_CLOSED,              /*!< Connection closed */
 } cft_event_type_t;
@@ -255,14 +255,14 @@ typedef struct {
     uint8_t conn_index;    /*!< Which connection (0..3) */
     union {
         struct {
-            char connection_id[37]; /*!< UUID the edge assigned to the connection */
+            char connection_id[37]; /*!< Connection UUID assigned by the edge */
             const char *location;   /*!< Edge data center, e.g. "fra12" */
             bool remotely_managed;  /*!< The tunnel is configured in the dashboard */
         } registered;               /*!< CFT_EVENT_REGISTERED */
         struct {
             const char *cause;      /*!< Reason given by the edge */
             int64_t retry_after_ms; /*!< Requested delay before retrying */
-            bool should_retry;      /*!< Whether retrying may help */
+            bool should_retry;      /*!< Whether the caller should retry */
         } failed;                   /*!< CFT_EVENT_REGISTRATION_FAILED */
         struct {
             int32_t version;  /*!< Configuration version */
@@ -313,7 +313,7 @@ typedef struct {
     void *event_arg;                 /*!< Passed to on_event */
     uint8_t num_connections;         /*!< 1..4; 0 means 1 */
     const uint8_t *connector_id;     /*!< 16 bytes, or NULL for a random one. Keep it stable across restarts:
-                                          the edge then replaces the previous run's connections right away. */
+                                          the edge then immediately replaces connections from the previous boot. */
     const char *edge_hosts[2];       /*!< Edge addresses, one per region; NULL for Cloudflare's */
     uint16_t edge_port;              /*!< 0 means 7844 */
     const char *version;             /*!< Reported to the edge; NULL for the component's */
@@ -321,13 +321,13 @@ typedef struct {
     size_t max_request_body;         /*!< Default limit of cft_stream_read_body() and of WebSocket messages; 0 means 16 KiB */
     uint32_t max_concurrent_streams; /*!< Open streams per connection, WebSockets included; more get 503. 0 means 16 */
     bool use_ingress_rules;          /*!< Route requests by the public hostnames configured in the dashboard:
-                                          services on localhost go to on_request (if set), others to
+                                          localhost services are passed to on_request (if set), others to
                                           cft_stream_proxy(). Without it, or until the edge sends the
                                           rules, all requests go to on_request. */
     uint8_t max_origin_connections;  /*!< Open connections to other hosts; more get 503. 0 means 4 */
-    uint32_t stream_window;          /*!< HTTP/2 receive window per stream: how much request body the edge
-                                          sends ahead. Bounds upload speed (window / round-trip time) and
-                                          what a paused stream can still receive. 0 means 64 KiB */
+    uint32_t stream_window;          /*!< HTTP/2 receive window per stream: maximum unacknowledged request body
+                                          bytes from the edge. Bounds upload throughput (window / round-trip
+                                          time) and buffered data for a paused stream. 0 means 64 KiB */
     size_t proxy_buffer_size;        /*!< Data buffered per proxied request in each direction, see
                                           cft_stream_proxy(). 0 means 16 KiB */
 } cft_tunnel_config_t;
@@ -363,8 +363,8 @@ void cft_tunnel_request_stop(cft_tunnel_t *tunnel, uint32_t stop_timeout_ms);
 /**
  * @brief Runs a function on the tunnel's thread; thread-safe
  *
- * Use it to answer requests or send WebSocket messages from other threads.
- * The function runs within about 100 ms. A stream may close in the meantime:
+ * Use this to send responses or WebSocket messages from other threads.
+ * The callback runs within 100 ms. A stream may close in the meantime:
  * keep track of on_close.
  *
  * @return 0 on success, -1 if out of memory

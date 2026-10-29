@@ -1,11 +1,10 @@
 /*
  * cft_transport_ops_t on mbedTLS over a non-blocking lwIP socket.
  *
- * Not esp-tls: its non-blocking connect waits for the TCP connection with
- * select() on fd sets kept in the connection, which a select() timeout
- * clears and nothing refills, so a TCP connect slower than the first call's
- * timeout never completes. Here the supervisor's select loop waits for the
- * socket, and each step (TCP connect, TLS handshake) only does what is ready.
+ * The supervisor's select() loop waits for socket readiness, and each step
+ * (TCP connect, TLS handshake) advances only when the socket is ready.
+ * (esp-tls is not used because its non-blocking connect path does not refill
+ * its select() descriptor sets after a timeout.)
  */
 #include <errno.h>
 #include <fcntl.h>

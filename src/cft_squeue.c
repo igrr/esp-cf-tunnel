@@ -8,7 +8,7 @@
 
 int cft_sq_append(cft_squeue_t *q, const void *data, size_t len)
 {
-    /* Allocate the segments first, so a failure leaves the queue as it was */
+    /* Allocate all required segments before modifying the queue so allocation failure is atomic */
     size_t room = q->tail ? q->tail->cap - q->tail->len : 0;
     cft_seg_t *first = NULL, *last = NULL;
     for (size_t need = len > room ? len - room : 0; need;) {

@@ -261,7 +261,7 @@ def test_post_from_another_thread(edge, connector):
 
 
 def test_streams_closed_with_connection(edge, connector):
-    """Open streams get on_close when the connection goes; LeakSanitizer checks the rest."""
+    """Open streams receive on_close when the connection closes; LeakSanitizer checks the rest."""
     connector()
     [conn] = edge.wait_registered()
     edge.call_soon(conn.open_stream, "GET", "/later")

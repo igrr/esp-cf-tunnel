@@ -1,6 +1,6 @@
-"""Relates a stress run's failures (events.log, from load.py) to what the
-device logged (serial.log): memory exhaustion, lost edge connections,
-outages and resets. Prints the failures nothing on the device explains.
+"""Correlates failures in events.log (from load.py) with device events in
+serial.log (memory exhaustion, lost edge connections, simulated outages, and
+reboots) and prints any unexplained failures.
 
     python3 analyze.py OUTDIR
 """

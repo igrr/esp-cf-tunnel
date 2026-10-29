@@ -30,8 +30,9 @@ static const char *TAG = "cft_conn";
 #define META_ORIGIN "{\"src\":\"origin\"}"
 #define META_CLOUDFLARED "{\"src\":\"cloudflared\"}"
 
-/* The edge pings every few seconds. If it goes quiet, ping it ourselves and
- * give up when that goes unanswered too. */
+/* The edge sends HTTP/2 PINGs every few seconds. If no data arrives for
+ * CFT_IDLE_PING_MS, send a PING and close the connection if no ACK arrives
+ * within CFT_PING_TIMEOUT_MS. */
 #ifndef CFT_IDLE_PING_MS
 #define CFT_IDLE_PING_MS 15000
 #endif
@@ -162,7 +163,7 @@ static int buf_append(buf_t *b, const void *data, size_t len)
         return 0;
     }
     if (b->off && b->len + len > b->cap) {
-        /* Reuse the space of data already passed on before growing */
+        /* Compact consumed prefix before growing the buffer */
         memmove(b->p, b->p + b->off, b->len - b->off);
         b->len -= b->off;
         b->off = 0;
@@ -320,9 +321,8 @@ static char *serialize_headers(const cft_header_t *h, size_t n)
     return out;
 }
 
-/* Ends a stream that cannot continue. Queuing the RST_STREAM needs memory
- * too; if that fails, cft_conn_tick() retries, so the visitor is not left
- * waiting on a stream nothing will be sent on. */
+/* Aborts a stream with RST_STREAM. If submitting the frame fails due to low
+ * memory, cft_conn_tick() retries so the stream does not hang. */
 static void stream_abort(cft_stream_t *s, uint32_t error_code)
 {
     s->write_failed = true;
@@ -335,7 +335,7 @@ static void stream_abort(cft_stream_t *s, uint32_t error_code)
 /*
  * Response headers as cloudflared sends them: user headers serialized in one
  * header (so HTTP/2 header rules don't apply to them), content-length also
- * as an HTTP/2 header, and the meta header naming the source.
+ * as an HTTP/2 header, and the meta header identifying the source.
  */
 static int submit_headers(cft_stream_t *s, int status, const cft_header_t *headers, size_t num_headers,
                           const char *meta)
@@ -362,7 +362,7 @@ static int submit_headers(cft_stream_t *s, int status, const cft_header_t *heade
     int rv = nghttp2_submit_response2(s->conn->h2, s->id, nva, nnv, &prd);
     free(serialized);
     if (rv != 0) {
-        /* Most likely out of memory; without a response the visitor would wait */
+        /* Allocation failed; reset the stream so the request does not hang */
         CFT_LOGW(TAG, "stream %d: cannot send the response, resetting", (int)s->id);
         stream_abort(s, NGHTTP2_INTERNAL_ERROR);
         return -1;
@@ -372,7 +372,7 @@ static int submit_headers(cft_stream_t *s, int status, const cft_header_t *heade
 }
 
 /* Queues response data. If memory runs out, the response cannot be completed
- * as announced, so the stream is reset rather than left with a gap. */
+ * as announced, so the stream is reset. */
 static int queue_out(cft_stream_t *s, const void *data, size_t len)
 {
     if (s->write_failed) {
@@ -1162,9 +1162,9 @@ static int on_data_chunk(nghttp2_session *session, uint8_t flags, int32_t stream
     /* The stream may have been reset, but not freed: that happens in
      * on_stream_close, after this callback. */
     if (s->paused) {
-        /* A paused stream gets no more window; the edge can send at most
-         * what it already had. The connection's window is returned, so the
-         * other streams keep flowing. */
+        /* Withhold stream window updates while paused so the edge stops after
+         * exhausting the current window. Return bytes to the connection window
+         * immediately so other streams are not blocked. */
         nghttp2_session_consume_connection(session, len);
         s->held += len;
         CFT_DEBUG_ADD(held, len);
@@ -1357,9 +1357,9 @@ cft_conn_t *cft_conn_new(const cft_conn_config_t *cfg)
         };
     }
     nghttp2_submit_settings(c->h2, NGHTTP2_FLAG_NONE, iv, niv);
-    /* Received data is returned to the connection window right away (see
-     * on_data_chunk); a little more than a stream's window keeps one stream
-     * from using it all up while its data is in flight. */
+    /* Set the connection window larger than a single stream window so one
+     * active stream cannot exhaust the connection window before on_data_chunk
+     * returns the consumed bytes. */
     uint32_t conn_window = window + NGHTTP2_INITIAL_WINDOW_SIZE;
     if (conn_window > (uint32_t)NGHTTP2_MAX_WINDOW_SIZE) {
         conn_window = NGHTTP2_MAX_WINDOW_SIZE;
@@ -1389,11 +1389,11 @@ void cft_conn_free(cft_conn_t *c)
 
 /*
  * The edge sends GOAWAY with last_stream_id set to one of its own (odd)
- * stream IDs. RFC 9113 says it names a stream initiated by the receiver, so
- * nghttp2 treats it as a connection error, which kills the session during a
- * graceful shutdown. We never initiate streams, so the correct value is 0;
- * rewrite it before nghttp2 sees the frame. Returns a patched copy of data
- * (to be freed) or NULL if nothing changed.
+ * stream IDs. RFC 9113 requires last_stream_id to identify a stream initiated
+ * by the receiver, so nghttp2 treats it as a connection error, which terminates
+ * the session during a graceful shutdown. We never initiate streams, so the
+ * valid value is 0; rewrite it before nghttp2 sees the frame. Returns a
+ * patched copy of data (to be freed) or NULL if nothing changed.
  */
 static uint8_t *fix_goaway(cft_conn_t *c, const uint8_t *data, size_t len)
 {
@@ -1449,8 +1449,8 @@ int cft_conn_recv(cft_conn_t *c, const uint8_t *data, size_t len)
     return c->alive ? 0 : -1;
 }
 
-/* Calls on_writable for streams whose queued data has been taken; returns
- * true if any was called. */
+/* Calls on_writable for streams whose send queue drained below low_water;
+ * returns true if a callback ran. */
 static bool notify_writable(cft_conn_t *c)
 {
     bool called = false;
@@ -1470,7 +1470,7 @@ static bool notify_writable(cft_conn_t *c)
 long cft_conn_send_data(cft_conn_t *c, const uint8_t **data)
 {
     for (;;) {
-        /* Streams below their low water get more data before it runs out */
+        /* Refill streams that dropped below low_water before serializing frames */
         while (notify_writable(c)) {
         }
         nghttp2_ssize n = nghttp2_session_mem_send2(c->h2, data);
@@ -1508,7 +1508,7 @@ void cft_conn_tick(cft_conn_t *c, int64_t now_ms)
     if (c->rx_since_tick) {
         c->rx_since_tick = false;
         c->last_rx_ms = now_ms;
-        c->ping_sent_ms = 0; /* anything from the edge proves the link works */
+        c->ping_sent_ms = 0; /* any incoming data confirms the connection is active */
     }
     if (!c->registered && !c->shutting_down && now_ms - c->created_ms > REGISTER_TIMEOUT_MS) {
         conn_fail(c, "registration timed out");

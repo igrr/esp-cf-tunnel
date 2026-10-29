@@ -1,8 +1,8 @@
 /*
  * Each proxied request gets its own origin connection (no pooling): a
  * non-blocking socket in the tunnel's poller. Both directions are bounded:
- * the request body is paused while the origin is slow to take it, and the
- * origin is not read while the response is still queued for the edge.
+ * the request body is paused when the origin reads slowly, and reading from
+ * the origin pauses when the response queue is full.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -65,7 +65,7 @@ typedef struct {
     cft_poll_entry_t *pe;
     int fd;
     pstate_t state;
-    bool tcp;           /* TCP over WebSocket rather than HTTP */
+    bool tcp;           /* TCP over WebSocket */
     bool upgrade;       /* WebSocket request to an HTTP origin */
     bool head_request;
     char *host_header;
@@ -85,7 +85,7 @@ typedef struct {
     bool resp_started;
     size_t up_high;   /* pause the request body above this */
     bool stall_armed; /* deadline set for STALL_TIMEOUT_MS */
-    bool shut_wr;     /* the visitor's end was passed on with shutdown() */
+    bool shut_wr;     /* SHUT_WR sent to origin after request body ended */
     size_t down_high; /* stop reading the origin above this */
 } proxy_t;
 
@@ -124,7 +124,7 @@ static void xbuf_free(xbuf_t *b)
 
 /* --- origin connection --- */
 
-/* Closes the origin side; the stream lives on until on_close */
+/* Closes the origin connection; the stream remains valid until on_close */
 static void origin_close(proxy_t *p, bool stream_alive)
 {
     if (p->pe) {
@@ -139,7 +139,7 @@ static void origin_close(proxy_t *p, bool stream_alive)
     cft_sq_free(&p->early);
     xbuf_free(&p->head);
     if (stream_alive) {
-        /* Let the rest of the request body come, to be dropped */
+        /* Resume flow control so any remaining request body drains and is discarded */
         cft_stream_pause_body(p->s, false);
     }
 }
@@ -159,7 +159,7 @@ static void update_want(proxy_t *p)
     cft_poll_want(p->pe, ev);
 }
 
-/* The origin failed or went away before the response was complete */
+/* The origin failed or closed the connection before the response completed */
 static void origin_error(proxy_t *p, const char *why)
 {
     CFT_LOGW(TAG, "%s: %s", cft_stream_request(p->s)->service, why);
@@ -186,11 +186,10 @@ static void finish(proxy_t *p)
     origin_close(p, true);
 }
 
-/* Once the visitor has finished sending on a byte stream (TCP over
- * WebSocket, upgraded HTTP) and all of it reached the origin, pass the end
- * on, as cloudflared does: the origin sees EOF, closes its side, and the
- * stream ends with it. Otherwise an origin that waits for more (an echo
- * server, a shell) would keep the stream and its origin connection open. */
+/* After the client closes its write side on a byte stream (TCP over
+ * WebSocket or upgraded HTTP) and all queued bytes are sent to the origin,
+ * call shutdown(SHUT_WR) so the origin receives EOF and closes the
+ * connection. */
 static void maybe_half_close(proxy_t *p)
 {
     if (p->body_ended && !p->shut_wr && p->fd >= 0 && p->up.pending == 0 &&
@@ -225,8 +224,7 @@ static void flush_up(proxy_t *p)
         p->stall_armed = false;
         maybe_half_close(p);
     } else if (progressed || !p->stall_armed) {
-        /* An origin that stops reading would hold the visitor's data and
-         * window credit for good; give up on it after a while */
+        /* Abort the transfer if the origin accepts no data for STALL_TIMEOUT_MS */
         cft_poll_deadline(p->pe, cft_port_now_ms() + STALL_TIMEOUT_MS);
         p->stall_armed = true;
     }
@@ -402,7 +400,7 @@ static bool start_response(proxy_t *p)
         line = eol ? eol + 1 : line_end;
     }
     if (chunked) {
-        /* The body goes out unframed; drop a Content-Length that came with it */
+        /* HTTP/2 frames the response body directly; strip any Content-Length header accompanying chunked encoding */
         size_t k = 0;
         for (size_t i = 0; i < n; i++) {
             if (strcasecmp(hdrs[i].name, "content-length") != 0) {
@@ -590,7 +588,7 @@ static void read_origin(proxy_t *p)
         }
         feed(p, buf, (size_t)n);
     }
-    /* Resumed from on_writable once the edge has taken the queued data */
+    /* on_writable resumes reading once the send queue drains below low_water */
     p->reading = p->fd >= 0 && cft_stream_buffered(p->s) < p->down_high;
     update_want(p);
 }
@@ -643,7 +641,7 @@ static void on_origin_event(void *arg, unsigned events)
     if (events & CFT_POLL_TIMEOUT) {
         char state[160];
         cft_stream_describe(p->s, state, sizeof(state));
-        /* Is the origin's data there, and does select() say so? */
+        /* Log socket readiness and peek state before aborting the stalled transfer */
         uint8_t byte;
         ssize_t peek = recv(p->fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
         int peek_errno = errno;
@@ -848,7 +846,7 @@ int cft_proxy_start(cft_stream_t *s, const char *service, const char *host_heade
         return -1;
     }
     if (sc->tcp && !req->is_websocket) {
-        /* Reached with a browser rather than `cloudflared access` */
+        /* Plain HTTP request to a TCP-over-WebSocket service */
         return cft_stream_respond(s, 400, "text/plain", "Use cloudflared access to connect\n", 34);
     }
     const cft_conn_config_t *cfg = cft_stream_config(s);
@@ -890,7 +888,7 @@ int cft_proxy_start(cft_stream_t *s, const char *service, const char *host_heade
         .on_close = on_close,
     };
     cft_stream_set_handlers(s, &h, p);
-    /* Read the origin again once half the queue has gone, not all of it */
+    /* Resume reading from the origin once half the queue has drained */
     cft_stream_set_low_water(s, p->down_high / 2);
     return 0;
 }

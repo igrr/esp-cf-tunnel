@@ -1,6 +1,6 @@
 """Proxying to other hosts by the tunnel's ingress rules (--ingress).
 
-The origins listen on 127.0.0.2, standing in for other hosts on the LAN
+The origins listen on 127.0.0.2, simulating other LAN hosts
 (127.0.0.1 and localhost count as the device itself).
 """
 
@@ -109,7 +109,7 @@ class _Server(socketserver.ThreadingTCPServer):
         threading.Thread(target=self.serve_forever, daemon=True).start()
 
     def handle_error(self, request, client_address):
-        pass  # visitors that go away reset the proxy's connection; not interesting
+        pass  # disconnected clients reset the proxy's connection; not interesting
 
     def server_bind(self):
         if self.rcvbuf:
@@ -129,7 +129,7 @@ def origins():
     http = _Server(_OriginHandler)
     slow = _Server(_OriginHandler, rcvbuf=4096)
     echo = _Server(_EchoHandler)
-    with socket.socket() as s:  # a port nobody listens on
+    with socket.socket() as s:  # an unbound port
         s.bind((ORIGIN_HOST, 0))
         closed_port = s.getsockname()[1]
     yield {"http": http, "slow": slow, "echo": echo, "closed_port": closed_port}
@@ -365,7 +365,7 @@ def test_proxy_buffer_size(edge, tunnel, size):
 
 def test_tcp_over_websocket_visitor_ends(edge, tunnel):
     """When the visitor's side ends (END_STREAM), the origin sees EOF and the stream ends:
-    an echo origin would otherwise keep the stream and its connection open for good"""
+    an echo origin would otherwise keep the stream and origin connection open indefinitely"""
     conn = tunnel("--max-origins", "1")
 
     async def session():

@@ -1,5 +1,5 @@
 /*
- * One tunnel connection over HTTP/2 (internal). It does no I/O: the
+ * One tunnel connection over HTTP/2 (internal). Does not perform I/O: the
  * supervisor (cft_tunnel.c) passes received bytes to cft_conn_recv() and
  * writes out what cft_conn_send_data() returns.
  */
@@ -79,16 +79,16 @@ bool cft_conn_is_alive(const cft_conn_t *conn);
 
 /* --- stream functions for the proxy (cft_proxy.c) --- */
 
-/* Error response from the connector rather than the origin (502, 504, ...) */
+/* Sends an error response from the connector (502, 504, ...) */
 int cft_stream_fail(cft_stream_t *s, int status);
-/* After cft_ws_accept(): the payload of data frames goes to on_body as it
+/* After cft_ws_accept(): passes the payload of data frames to on_body as it
  * arrives, without message reassembly or size limit */
 void cft_stream_set_ws_raw(cft_stream_t *s);
 /* Sets cft_request_t.service; copied */
 int cft_stream_set_service(cft_stream_t *s, const char *service);
 const cft_conn_config_t *cft_stream_config(const cft_stream_t *s);
-/* Also call on_writable once no more than `bytes` are left queued (0: only
- * when all has been passed on) */
+/* Also calls on_writable once no more than `bytes` remain queued (0: only
+ * when the queue is empty) */
 void cft_stream_set_low_water(cft_stream_t *s, size_t bytes);
 /* The request body is complete */
 bool cft_stream_body_ended(const cft_stream_t *s);

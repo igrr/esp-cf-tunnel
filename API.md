@@ -31,8 +31,8 @@
 |  size\_t | [**cft\_stream\_buffered**](#function-cft_stream_buffered) (const [**cft\_stream\_t**](#typedef-cft_stream_t)\* s) <br>_Response bytes queued but not yet passed to the connection._ |
 |  int | [**cft\_stream\_end**](#function-cft_stream_end) ([**cft\_stream\_t**](#typedef-cft_stream_t)\* s) <br>_Ends the response once the queued data has been sent._ |
 |  const char \* | [**cft\_stream\_header**](#function-cft_stream_header) (const [**cft\_stream\_t**](#typedef-cft_stream_t)\* s, const char \* name) <br>_Value of a request header._ |
-|  void | [**cft\_stream\_pause\_body**](#function-cft_stream_pause_body) ([**cft\_stream\_t**](#typedef-cft_stream_t)\* s, bool pause) <br>_Stops or resumes the flow of request body data._ |
-|  int | [**cft\_stream\_proxy**](#function-cft_stream_proxy) ([**cft\_stream\_t**](#typedef-cft_stream_t)\* s, const char \* service) <br>_Passes the request on to another host, as cloudflared does._ |
+|  void | [**cft\_stream\_pause\_body**](#function-cft_stream_pause_body) ([**cft\_stream\_t**](#typedef-cft_stream_t)\* s, bool pause) <br>_Pauses or resumes incoming request body data._ |
+|  int | [**cft\_stream\_proxy**](#function-cft_stream_proxy) ([**cft\_stream\_t**](#typedef-cft_stream_t)\* s, const char \* service) <br>_Forwards the request to another host, as cloudflared does._ |
 |  int | [**cft\_stream\_read\_body**](#function-cft_stream_read_body) ([**cft\_stream\_t**](#typedef-cft_stream_t)\* s, size\_t max\_len, void(\*)([**cft\_stream\_t**](#typedef-cft_stream_t)\*s, void \*ctx, const uint8\_t \*body, size\_t len) fn, void \* ctx) <br>_Collects the request body, then calls a function with it._ |
 |  const [**cft\_request\_t**](#struct-cft_request_t)\* | [**cft\_stream\_request**](#function-cft_stream_request) (const [**cft\_stream\_t**](#typedef-cft_stream_t)\* s) <br>_Request of this stream; valid until on\_close._ |
 |  void | [**cft\_stream\_reset**](#function-cft_stream_reset) ([**cft\_stream\_t**](#typedef-cft_stream_t)\* s) <br>_Aborts the stream (HTTP/2 RST\_STREAM); on\_close follows._ |
@@ -100,7 +100,7 @@ _Called when the headers of a new request have arrived._
 typedef void(*) cft_request_fn(void *arg, cft_stream_t *s, const cft_request_t *req);
 ```
 
-Respond right away ([**cft\_stream\_respond()**](#function-cft_stream_respond)), read the body ([**cft\_stream\_read\_body()**](#function-cft_stream_read_body)), accept a WebSocket ([**cft\_ws\_accept()**](#function-cft_ws_accept)), or set handlers ([**cft\_stream\_set\_handlers()**](#function-cft_stream_set_handlers)) and respond later. A stream with no response stays open until the visitor gives up.
+Respond right away ([**cft\_stream\_respond()**](#function-cft_stream_respond)), read the body ([**cft\_stream\_read\_body()**](#function-cft_stream_read_body)), accept a WebSocket ([**cft\_ws\_accept()**](#function-cft_ws_accept)), or set handlers ([**cft\_stream\_set\_handlers()**](#function-cft_stream_set_handlers)) and respond later. A stream with no response stays open until the visitor disconnects.
 ### struct `cft_request_t`
 
 _Request, as received from the edge._
@@ -134,9 +134,9 @@ Variables:
 
 -  void(\*) on_body_end  <br>The request body is complete (also called for requests without a body)
 
--  void(\*) on_close  <br>The stream is gone: the response was sent, or the visitor or the connection went away. The stream must not be used afterwards; free ctx here. completed is true if the whole response was sent.
+-  void(\*) on_close  <br>The stream has closed: the response completed, the visitor disconnected, or the connection closed. The stream must not be used afterwards; free ctx here. completed is true if the full response was sent.
 
--  void(\*) on_writable  <br>Everything written so far has been passed on; write more now
+-  void(\*) on_writable  <br>All queued response data has been handed to the HTTP/2 session; write the next chunk now
 
 -  void(\*) on_ws_message  <br>A complete WebSocket text or binary message (after [**cft\_ws\_accept()**](#function-cft_ws_accept))
 
@@ -178,7 +178,7 @@ Variables:
 
 -  const char \* arch  <br>Reported to the edge; NULL for "unknown"
 
--  const uint8\_t \* connector_id  <br>16 bytes, or NULL for a random one. Keep it stable across restarts: the edge then replaces the previous run's connections right away.
+-  const uint8\_t \* connector_id  <br>16 bytes, or NULL for a random one. Keep it stable across restarts: the edge then immediately replaces connections from the previous boot.
 
 -  const char \* edge_hosts  <br>Edge addresses, one per region; NULL for Cloudflare's
 
@@ -202,11 +202,11 @@ Variables:
 
 -  void \* request_arg  <br>Passed to on\_request
 
--  uint32\_t stream_window  <br>HTTP/2 receive window per stream: how much request body the edge sends ahead. Bounds upload speed (window / round-trip time) and what a paused stream can still receive. 0 means 64 KiB
+-  uint32\_t stream_window  <br>HTTP/2 receive window per stream: maximum unacknowledged request body bytes from the edge. Bounds upload throughput (window / round-trip time) and buffered data for a paused stream. 0 means 64 KiB
 
 -  const char \* token  <br>Tunnel token; copied
 
--  bool use_ingress_rules  <br>Route requests by the public hostnames configured in the dashboard: services on localhost go to on\_request (if set), others to [**cft\_stream\_proxy()**](#function-cft_stream_proxy). Without it, or until the edge sends the rules, all requests go to on\_request.
+-  bool use_ingress_rules  <br>Route requests by the public hostnames configured in the dashboard: localhost services are passed to on\_request (if set), others to [**cft\_stream\_proxy()**](#function-cft_stream_proxy). Without it, or until the edge sends the rules, all requests go to on\_request.
 
 -  const char \* version  <br>Reported to the edge; NULL for the component's
 
@@ -276,7 +276,7 @@ const char * cft_stream_header (
 The value, or NULL if the header is absent
 ### function `cft_stream_pause_body`
 
-_Stops or resumes the flow of request body data._
+_Pauses or resumes incoming request body data._
 ```c
 void cft_stream_pause_body (
     cft_stream_t * s,
@@ -284,7 +284,7 @@ void cft_stream_pause_body (
 ) 
 ```
 
-While paused, the edge can still send what it was already allowed to (up to 64 KiB per stream), which on\_body receives as usual; then it waits. Use it when the body goes somewhere slower than the network, e.g. flash.
+While paused, the edge can still send up to the remaining stream window ([**cft\_tunnel\_config\_t.stream\_window**](#variable-stream_window), 64 KiB by default), which on\_body receives as usual before the stream stops. Use this when the consumer is slower than the network, e.g. when writing to flash.
 
 
 
@@ -292,10 +292,10 @@ While paused, the edge can still send what it was already allowed to (up to 64 K
 
 
 * `s` Stream 
-* `pause` true to stop, false to resume
+* `pause` true to pause, false to resume
 ### function `cft_stream_proxy`
 
-_Passes the request on to another host, as cloudflared does._
+_Forwards the request to another host, as cloudflared does._
 ```c
 int cft_stream_proxy (
     cft_stream_t * s,
@@ -304,13 +304,13 @@ int cft_stream_proxy (
 ```
 
 Services:
-* [http://host](http://host)[:port], ws://host[:port]: HTTP/1.1 proxy, WebSockets included;
-* ssh://, rdp://, smb://, tcp://host[:port]: TCP over WebSocket, the form `cloudflared access`uses on the visitor's side;
+* [http://host](http://host)[:port], ws://host[:port]: HTTP/1.1 proxy, including WebSockets;
+* ssh://, rdp://, smb://, tcp://host[:port]: TCP over WebSocket, used with `cloudflared access`on the client side;
 * http\_status:CODE: an empty response with that status.
 
-Not supported: [https://](https://)and wss:// origins, unix sockets, and cloudflared's built-in services (hello\_world, bastion, socks5).
+Unsupported: [https://](https://)and wss:// origins, Unix sockets, and cloudflared's built-in services (hello\_world, bastion, socks5).
 
-Each request gets its own connection to the origin. The tunnel then owns the stream; do not set handlers. If the origin cannot be reached, the visitor gets 502; over max\_origin\_connections, 503. Resolving a host name blocks the tunnel's thread; IP addresses do not.
+Each request opens a separate connection to the origin. The tunnel takes ownership of the stream; do not set handlers on it. If the origin cannot be reached, the visitor receives 502; above max\_origin\_connections, 503. Resolving a hostname blocks the tunnel thread; IP addresses do not.
 
 
 
@@ -452,7 +452,7 @@ int cft_stream_write (
 ) 
 ```
 
-The data is copied. To limit memory use, write more from on\_writable rather than all at once.
+The data is copied. To limit memory usage, write chunks from on\_writable.
 
 
 
@@ -499,7 +499,7 @@ int cft_tunnel_post (
 ) 
 ```
 
-Use it to answer requests or send WebSocket messages from other threads. The function runs within about 100 ms. A stream may close in the meantime: keep track of on\_close.
+Use this to send responses or WebSocket messages from other threads. The callback runs within 100 ms. A stream may close in the meantime: keep track of on\_close.
 
 
 

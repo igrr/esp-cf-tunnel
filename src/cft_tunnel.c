@@ -1,9 +1,9 @@
 /*
  * Supervisor: keeps cfg.num_connections connections to the edge, each in a
- * slot with its own connection index. A slot that fails waits with
- * exponential backoff and alternates regions; a slot whose connection the
- * edge drains is replaced right away under a free index, so requests keep
- * flowing while the old connection finishes.
+ * slot with its own connection index. Failed slots reconnect with exponential
+ * backoff and alternate regions; when the edge drains a connection, the
+ * supervisor opens a replacement in a free slot before closing the draining
+ * connection.
  *
  * With use_ingress_rules, requests are routed by the ingress rules the edge
  * pushes, to on_request or to the proxy; the proxy's origin sockets share
@@ -167,7 +167,7 @@ static unsigned num_slots_in(cft_tunnel_t *t, bool count_draining)
     return n;
 }
 
-/* Region used by fewer of the other slots, so connections spread out */
+/* Select the region with fewer active slots */
 static uint8_t pick_region(cft_tunnel_t *t, int except)
 {
     int use[2] = {0, 0};
@@ -213,7 +213,7 @@ static void slot_wait(cft_tunnel_t *t, int i, int64_t now)
     CFT_LOGI(TAG, "connection %d: retrying in %u ms", i, (unsigned)delay);
 }
 
-/* Tears down whatever the slot has, then retries or frees it. */
+/* Frees the slot's connection and transport, then schedules a retry or releases the slot. */
 static void slot_close(cft_tunnel_t *t, int i, int64_t now)
 {
     slot_t *s = &t->slots[i];
@@ -234,7 +234,7 @@ static void slot_close(cft_tunnel_t *t, int i, int64_t now)
         return;
     }
     if (was_registered) {
-        /* It worked until now: reconnect right away, same region */
+        /* Previously registered connection dropped: reconnect after BACKOFF_MIN_MS in the same region */
         s->backoff_ms = BACKOFF_MIN_MS;
     } else {
         if (s->attempts < UINT8_MAX) {
@@ -534,7 +534,7 @@ void cft_tunnel_run(cft_tunnel_t *t)
         }
 
         now = cft_port_now_ms();
-        /* Origins first: what they produce goes out in the flushes below */
+        /* Dispatch origin sockets first so their output is flushed to the edge in the same iteration */
         cft_poller_dispatch(t->poller, &rfds, &wfds, now);
         for (int i = 0; i < MAX_SLOTS; i++) {
             slot_t *s = &t->slots[i];

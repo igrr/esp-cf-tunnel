@@ -516,8 +516,8 @@ class Load:
             self.bodies.append((b, fnv(b)))
         limits = httpx.Limits(max_connections=20)
         timeout = httpx.Timeout(120, connect=30)
-        # HTTP/1.1 towards Cloudflare: the edge multiplexes into the tunnel anyway, and
-        # httpx's HTTP/2 client does not cope well with abandoned requests
+        # Use HTTP/1.1 to the edge: the edge multiplexes requests onto the HTTP/2 tunnel, and
+        # httpx's HTTP/2 client can fail other requests on a connection when one request is cancelled
         self.clients = [httpx.AsyncClient(limits=limits, timeout=timeout) for _ in range(4)]
         access = None
         if self.args.access_port:

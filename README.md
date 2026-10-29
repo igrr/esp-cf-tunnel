@@ -1,22 +1,12 @@
 # esp-cf-tunnel: Cloudflare Tunnel connector for ESP-IDF
 
-The device opens a tunnel connection to the Cloudflare edge itself and serves
-the HTTP requests that arrive on it, without cloudflared or a proxy host. It
-speaks cloudflared's HTTP/2 transport.
+`esp-cf-tunnel` connects an ESP-IDF device directly to the Cloudflare edge over `cloudflared`'s HTTP/2 transport and serves incoming HTTP requests without a separate `cloudflared` host.
 
-Status: works against the production edge from a Linux host and from an
-ESP32-P4 over Ethernet: HTTP requests with streamed request and response
-bodies, WebSockets, up to four redundant connections, and proxying to other
-hosts on the network (HTTP, WebSockets, and TCP for `cloudflared access`).
-Not supported: private network routing (WARP), the QUIC transport.
+Supported features include HTTP requests with streamed request and response bodies, WebSockets, up to four redundant edge connections, and proxying to other hosts on the local network (HTTP, WebSockets, and TCP for `cloudflared access`). Private network routing (WARP) and the QUIC transport are not supported.
 
 ## Usage
 
-Create a remotely managed tunnel in the Cloudflare dashboard, add a public
-hostname to it, and pass the tunnel token to the component. By default the
-device answers every request routed to the tunnel, whatever the hostname's
-service URL; see [Reaching other devices](#reaching-other-devices) for
-routing by service.
+Create a remotely managed tunnel in the Cloudflare dashboard, configure a public hostname for it, and pass the tunnel token to the component. By default, the device handles every request routed to the tunnel regardless of the hostname's configured service URL; see [Reaching other devices](#reaching-other-devices) to route requests by service.
 
 ```c
 #include "cf_tunnel_esp.h"
@@ -34,20 +24,12 @@ cft_tunnel_handle_t tunnel;
 ESP_ERROR_CHECK(cft_tunnel_start(&cfg, &tunnel));
 ```
 
-`on_request` runs in the tunnel task as soon as the request headers arrive.
-From there, a handler can:
+`on_request` runs on the tunnel task as soon as the request headers arrive. From this callback, a handler can:
 
-- respond at once: `cft_stream_respond()`;
-- collect the body first: `cft_stream_read_body(s, max_len, fn, ctx)`, which
-  answers 413 to bodies over the limit;
-- stream: set callbacks with `cft_stream_set_handlers()` (`on_body`,
-  `on_body_end`, `on_writable`, `on_close`) and send the response with
-  `cft_stream_send_headers()`, `cft_stream_write()` and `cft_stream_end()`.
-  `on_writable` fires once the queued data has been passed on, which is the
-  moment to write the next part of a large response;
-- accept a WebSocket (`req->is_websocket`): `cft_ws_accept()`, then
-  `on_ws_message` gets each message and `cft_ws_send()` sends. Fragmentation,
-  pings and the close handshake are handled by the component.
+- Respond immediately with `cft_stream_respond()`.
+- Buffer the request body with `cft_stream_read_body(s, max_len, fn, ctx)`, which returns HTTP 413 if the body exceeds `max_len`.
+- Stream the request and response by registering callbacks with `cft_stream_set_handlers()` (`on_body`, `on_body_end`, `on_writable`, `on_close`) and sending response data with `cft_stream_send_headers()`, `cft_stream_write()`, and `cft_stream_end()`. `on_writable` runs when queued response data has been handed to the HTTP/2 session, allowing the handler to write the next chunk of a large response.
+- Accept a WebSocket request (`req->is_websocket`) with `cft_ws_accept()`. Incoming messages arrive at `on_ws_message`, and `cft_ws_send()` sends outgoing messages. The component handles frame reassembly, pings, and the close handshake.
 
 ```c
 static void ws_message(cft_stream_t *s, void *ctx, cft_ws_opcode_t op,
@@ -64,34 +46,22 @@ static void ws_message(cft_stream_t *s, void *ctx, cft_ws_opcode_t op,
     }
 ```
 
-All stream functions must be called from the tunnel task. To respond or send
-WebSocket messages from another task, use `cft_tunnel_post()`, which runs a
-function in the tunnel task within about 100 ms. A stream is valid until its
-`on_close` callback. See [API.md](API.md) for the full API, and
-`examples/tunnel_ethernet` and `test_apps/host/main.c` for complete handlers.
+### Threading and Connections
 
-Connections: by default the tunnel keeps one connection to the edge
-(`num_connections`, up to 4, spread over both edge regions). When the edge
-drains a connection, a replacement is opened before the old one closes; a
-lost connection is reconnected with backoff, and a connection that stops
-answering HTTP/2 PINGs is dropped within about 25 s. On ESP-IDF the connector
-ID is derived from the MAC address, so after a reboot the edge replaces the
-old connections at once instead of routing requests to them until they time
-out.
+All stream functions must be called from the tunnel task. To send responses or WebSocket messages from another task, call `cft_tunnel_post()`, which schedules a callback on the tunnel task within 100 ms. A stream pointer remains valid until its `on_close` callback returns. See [API.md](API.md) for the complete API reference, and `examples/tunnel_ethernet` and `test_apps/host/main.c` for full handler examples.
 
-### Reaching other devices
+By default, the tunnel maintains one edge connection (`num_connections` supports 1 to 4 connections distributed across both edge regions). When the edge drains a connection, the supervisor opens a replacement before closing the draining connection. Disconnected slots reconnect with exponential backoff, and connections that stop answering HTTP/2 PING frames are closed after 25 seconds. On ESP-IDF, the connector derives a stable connector ID from the base MAC address and tunnel ID so that the edge immediately replaces connections from a previous boot after a restart.
 
-Like cloudflared, the device can pass requests on to other hosts on its
-network. With `use_ingress_rules` set, requests are routed by the public
-hostnames configured for the tunnel in the dashboard, which the edge sends to
-the device:
+### Reaching Other Devices
+
+When `use_ingress_rules` is enabled, the connector routes incoming requests using the public hostname rules configured in the Cloudflare dashboard and pushed by the edge:
 
 | Service in the dashboard | Handled by |
 |---|---|
-| `http://localhost:PORT`, `http://127.0.0.1:PORT` | `on_request` on the device (`req->service` tells which) |
-| `http://HOST:PORT`, `ws://HOST:PORT` | HTTP/1.1 proxy to that host, WebSockets included |
-| `ssh://`, `rdp://`, `smb://`, `tcp://HOST:PORT` | TCP over WebSocket, for `cloudflared access ssh/rdp/tcp` on the visitor's side |
-| `http_status:CODE` | empty response with that status |
+| `http://localhost:PORT`, `http://127.0.0.1:PORT` | `on_request` on the device (`req->service` contains the matched service URL) |
+| `http://HOST:PORT`, `ws://HOST:PORT` | HTTP/1.1 proxy to that host, including WebSockets |
+| `ssh://`, `rdp://`, `smb://`, `tcp://HOST:PORT` | TCP over WebSocket, compatible with `cloudflared access ssh/rdp/tcp` |
+| `http_status:CODE` | Empty response with the specified HTTP status code |
 
 ```c
 cft_tunnel_config_t cfg = {
@@ -101,200 +71,47 @@ cft_tunnel_config_t cfg = {
 };
 ```
 
-Hostname wildcards (`*.example.com`), path regexes (POSIX extended syntax,
-which covers the common cases of Go's RE2) and `httpHostHeader` work as in
-cloudflared. Until the rules arrive, requests go to `on_request`. A handler
-can also proxy a request itself with `cft_stream_proxy(s, "http://...")`.
+Hostname wildcards (`*.example.com`), path regular expressions (POSIX extended syntax), and `httpHostHeader` overrides work as in `cloudflared`. Before the initial configuration arrives from the edge, all requests go to `on_request`. A request handler can also forward an individual stream by calling `cft_stream_proxy(s, "http://...")`.
 
-Each proxied request opens its own connection to the origin, at most
-`max_origin_connections` at a time (default 4; more get 503). The proxy
-buffers at most about 16 KB in each direction per request, plus what the
-edge has in flight: an origin that reads slowly pauses the visitor's upload
-through HTTP/2 flow control (`cft_stream_pause_body()`, also available to
-handlers, e.g. for writing uploads to flash). Not supported: `https://`
-origins, unix sockets, cloudflared's built-in services, and private network
-routing (WARP). Host names in service URLs are resolved on the tunnel task,
-which blocks it briefly; IP addresses avoid that.
+Each proxied request opens a separate TCP connection to the origin, up to `max_origin_connections` concurrent connections (default 4; additional requests receive HTTP 503). When an origin reads slowly, the proxy pauses the incoming request body through HTTP/2 stream flow control (`cft_stream_pause_body()`, which is also available to local request handlers). Origins using `https://` or `wss://`, Unix domain sockets, `cloudflared` built-in services, and private network routing (WARP) are not supported. Resolving hostnames in service URLs blocks the tunnel task during DNS lookup; using IP addresses avoids this delay.
 
-The device connects only to hosts named in the tunnel's rules (or by the
-application), and anyone who can edit the tunnel in the dashboard can point
-it at any host the device can reach. Use Cloudflare Access on the public
-hostnames as you would with cloudflared.
+The connector only connects to origins specified in the tunnel's ingress rules or passed to `cft_stream_proxy()`. Because anyone with permission to edit the tunnel in the Cloudflare dashboard can point rules at hosts on the device's local network, protect public hostnames with Cloudflare Access as you would with `cloudflared`.
 
-### TLS and memory
+## Configuration and Tuning
 
-The component needs `CONFIG_MBEDTLS_SSL_PROTO_TLS1_3=y`: the edge refuses
-TLS 1.2. The edge sends full 16 KB TLS records, but the device's own records
-can be small: `CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN=y` with
-`CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096` saves 12 KB.
-(`CONFIG_MBEDTLS_DYNAMIC_BUFFER` saves more, but IDF 5.x does not allow it
-together with TLS 1.3.)
+### TLS and Memory
 
-Measured on ESP32-P4 (internal RAM, no PSRAM; IDF v6.2-dev; asymmetric TLS
-buffers as above): one connected tunnel connection uses about 49 KB of heap
-when idle (including the 8 KB task stack) and about 71 KB at peak, during a
-WebSocket session followed by a burst of 50 concurrent requests. The tunnel
-task used at most about 3 KB of its stack. Flash: 23 KB for this component and
-79 KB for nghttp2.
+The component requires `CONFIG_MBEDTLS_SSL_PROTO_TLS1_3=y` because the Cloudflare edge rejects TLS 1.2. While the edge sends full 16 KiB TLS records, outgoing records from the device are smaller: setting `CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN=y` and `CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096` reduces the mbedTLS output buffer per connection. (`CONFIG_MBEDTLS_DYNAMIC_BUFFER` cannot be combined with TLS 1.3 in ESP-IDF 5.x.)
 
-Proxying to another host on the LAN, one request at a time, raised the peak
-by about 50 KB for HTTP (a 5 MB download at about 450 KB/s, a 3 MB upload at
-about 270 KB/s, an upload to an origin that stalls) and about 60 KB for a
-`cloudflared access tcp` session. Most of it is data the edge may send before
-the device's flow control stops it (64 KB per stream). These figures are for
-IDF's default lwIP settings; see below for faster ones.
+Besides the base TLS and HTTP/2 session state per connection, active streams allocate memory proportional to traffic:
 
-### Memory under load
+- Each open stream (HTTP request or WebSocket) allocates headers and `nghttp2` stream state.
+- Outgoing response data is queued in segments of at most 4 KiB, avoiding large contiguous allocations on a fragmented heap. Handlers streaming large responses should write chunks from `on_writable` instead of queuing the entire body at once.
+- The edge can send up to `stream_window` bytes of a request body before flow control pauses the stream (`cft_stream_pause_body()` or a slow proxied origin). Only the paused stream stops; other streams on the connection continue receiving data.
+- Each proxied request buffers up to `proxy_buffer_size` bytes in each direction, in addition to data buffered in the lwIP receive window (`CONFIG_LWIP_TCP_WND_DEFAULT`). If a proxied origin accepts no data for 30 seconds, the proxy aborts the transfer.
 
-What a busy tunnel holds, besides the fixed cost above:
+On chips where mbedTLS encrypts TLS records with the hardware AES DMA engine (such as the ESP32-P4), each record allocates DMA descriptors from internal RAM. If internal RAM is exhausted during peak traffic, the TLS write fails and the connection reconnects. To prevent internal RAM exhaustion:
 
-- each open stream (request, WebSocket) takes about 2 KB: its headers and
-  nghttp2's state;
-- response data waiting for the edge is queued in pieces of at most 4 KB, so
-  a large response does not need a large free block; handlers should write
-  more from `on_writable` rather than queue everything at once;
-- request data: the edge may send `stream_window` of a request body ahead,
-  so a stream whose body is paused (`cft_stream_pause_body()`, or a proxied
-  origin that reads slowly) can hold up to that much. Only the paused
-  stream waits; the others keep flowing. (Holding back the connection's
-  window as well would bound the total, but a few slow origins would then
-  stall every stream on the connection: the stress test saw WebSocket
-  echoes wait 30 s.);
-- each proxied request also has a socket to the origin: up to
-  `proxy_buffer_size` queued in each direction, plus what lwIP has received
-  from the origin while the edge is slower, up to `CONFIG_LWIP_TCP_WND_DEFAULT`.
-  A proxied upload whose origin takes nothing for 30 s is aborted.
+- Enable PSRAM (as configured in `examples/tunnel_ethernet/sdkconfig.defaults`): allocations above 1 KiB, lwIP buffers, and mbedTLS buffers are placed in PSRAM, while `CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL` reserves 64 KiB of internal RAM for AES and Ethernet DMA descriptors.
+- On boards without PSRAM, set `CONFIG_MBEDTLS_HARDWARE_AES=n` to perform AES in software without DMA descriptor allocations, at the cost of lower throughput. (Disabling only `CONFIG_MBEDTLS_HARDWARE_GCM` is insufficient with mbedTLS 4 in ESP-IDF 6, which still uses the AES DMA engine for GCM.)
 
-Hardware AES needs memory too: on chips where mbedTLS encrypts large TLS
-records with the AES DMA engine (e.g. the ESP32-P4), every such record
-allocates a few small DMA descriptors in internal RAM, and if internal RAM is
-exhausted at that moment the TLS connection fails and is re-established,
-failing its streams. In the stress test on internal RAM alone this happened
-every few minutes at peak load. Two ways out:
-
-- PSRAM, as `examples/tunnel_ethernet` does: buffers of more than 1 KB,
-  lwIP's and mbedTLS's go to PSRAM, and `CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL`
-  keeps 64 KB of internal RAM for what must be internal (DMA descriptors of
-  the AES and Ethernet drivers). Under the same load, internal RAM never went
-  below 300 KB free and no connection failed; throughput was within 10 % of
-  internal RAM (ESP32-P4: 1.9-2.1 MB/s down, 0.7-0.8 MB/s up);
-- without PSRAM, `CONFIG_MBEDTLS_HARDWARE_AES=n` at a cost in speed
-  (ESP32-P4: 0.8 instead of 2.2 MB/s down, 0.55 instead of 0.8 MB/s up).
-  Turning off only `CONFIG_MBEDTLS_HARDWARE_GCM` does not help with
-  mbedTLS 4 (IDF 6), which still uses the AES DMA engine for GCM.
-
-When memory runs short, new requests get 503 while less than
-`CONFIG_CF_TUNNEL_MIN_FREE_HEAP` is free (32 KiB by default), and a stream
-whose data cannot be queued is reset rather than sent with a gap. Keep
-`max_concurrent_streams`, `max_origin_connections`, `num_connections` and
-`stream_window` in proportion to the heap: the stress test below runs two
-connections with a 64 KiB window and four origin connections on the
-ESP32-P4's internal RAM.
+When free heap drops below `CONFIG_CF_TUNNEL_MIN_FREE_HEAP` (32 KiB by default), the connector rejects new requests with HTTP 503 so existing connections and streams can complete. If queuing response data fails due to an allocation error, the stream is reset with `RST_STREAM`. Size `max_concurrent_streams`, `max_origin_connections`, `num_connections`, and `stream_window` to match available RAM.
 
 ### Throughput
 
-Each connection's speed is bounded by window / round-trip time, and with
-IDF's defaults the bound is lwIP's: `CONFIG_LWIP_TCP_WND_DEFAULT` and
-`CONFIG_LWIP_TCP_SND_BUF_DEFAULT` are 5760 bytes, about 0.4 MB/s at the
-15-20 ms the device had to the edge. Settings, from the largest effect:
+Connection throughput is bounded by the TCP and HTTP/2 window sizes divided by the round-trip time to the edge. With ESP-IDF's default 5760-byte lwIP TCP windows, throughput is limited by TCP flow control. The following settings adjust transfer speed and buffer allocation:
 
 | Setting | Effect |
 |---|---|
-| `CONFIG_LWIP_TCP_WND_DEFAULT`, `CONFIG_LWIP_TCP_SND_BUF_DEFAULT` | 32768 instead of 5760: downloads and uploads about 6-10 times faster. Raise `CONFIG_LWIP_TCP_RECVMBOX_SIZE` and `CONFIG_LWIP_TCPIP_RECVMBOX_SIZE` with them (64). 65535 was not faster. |
-| `stream_window` | HTTP/2 window per stream, 64 KiB by default: uploads (request bodies) are bounded by it once lwIP's window is larger. 128 KiB about doubled proxied uploads; 256 KiB was a little faster still. |
-| `proxy_buffer_size` | 16 KiB by default; 64 KiB made proxied downloads 10-15 % faster. |
-| `CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN` | 16384 instead of 4096 was not faster, and used 12 KB more. |
-| `CONFIG_LWIP_IRAM_OPTIMIZATION`, `CONFIG_LWIP_EXTRA_IRAM_OPTIMIZATION`, `CONFIG_ETH_IRAM_OPTIMIZATION` | No measurable change. The device is not CPU-bound: during the fastest transfers the tunnel task used at most 72 % of a core (generating the test data included), and each core was idle at least 25 % of the time. |
+| `CONFIG_LWIP_TCP_WND_DEFAULT`, `CONFIG_LWIP_TCP_SND_BUF_DEFAULT` | Increasing the TCP window and send buffer (for example to 32768) raises download and upload throughput. Increase `CONFIG_LWIP_TCP_RECVMBOX_SIZE` and `CONFIG_LWIP_TCPIP_RECVMBOX_SIZE` (for example to 64) alongside them. |
+| `stream_window` | Per-stream HTTP/2 receive window (64 KiB by default). Bounds upload throughput once the lwIP TCP window is large enough, and sets the maximum request body data buffered for a paused stream. |
+| `proxy_buffer_size` | Per-direction buffer for each proxied request (16 KiB by default). Larger values reduce read/write stalls on fast origins. |
 
-Measured on the ESP32-P4 over 100 Mbit Ethernet with 5 MB transfers (3 MB
-for proxied uploads), through the production edge from a visitor with
-60 MB/s to Cloudflare. Rates depend on the edge location the device gets:
-the same build was about 1.7 times faster through Prague (prg) than through
-Frankfurt (fra).
-
-| Configuration | Edge | Download | Upload | Proxied download | Proxied upload | Peak heap above idle |
-|---|---|---|---|---|---|---|
-| IDF defaults (lwIP 5760), component defaults | fra | 0.4 MB/s | 0.2-0.4 MB/s | 0.3 MB/s | 0.2 MB/s | 18 KB, proxied 51 KB |
-| lwIP 32768 | prg | 3.3-4 MB/s | 0.9-2.7 MB/s | 3-3.2 MB/s | 0.8-0.9 MB/s | 75-82 KB, proxied 107 KB |
-| lwIP 32768, `stream_window` 128 KiB (the example) | fra | 1.8-2.3 MB/s | 0.8-2 MB/s | 1.9-2 MB/s | 1.7-1.9 MB/s | 47 KB, proxied 107 KB |
-| lwIP 32768, `stream_window` 256 KiB | fra | 2.1-2.5 MB/s | 1.3-2.2 MB/s | 1.9-2.1 MB/s | 1.9-2.1 MB/s | 47 KB, proxied 107 KB |
-| lwIP 32768, `stream_window` 256 KiB | prg | 4-4.1 MB/s | 1.9-4.2 MB/s | 3.8 MB/s | 3.3 MB/s | 76 KB, proxied 107 KB |
-
-Ranges span repeated runs; the first upload after connecting is the slowest
-(TCP slow start).
-
-Services on other hosts get the same speed as handlers on the device: with
-8 MB transfers to another computer on the LAN, proxied HTTP downloads and
-`cloudflared access tcp` downloads ran at 3.7 MB/s (prg) and 2.0-2.3 MB/s
-(fra), like local downloads, and proxied HTTP uploads at 1.1 and 0.8 MB/s,
-like local uploads. TCP uploads were faster than HTTP uploads, at 2.4 and
-1.9 MB/s. HTTP uploads are bound by `stream_window`: in those runs the tunnel
-task was busy only 9-13 % of the time.
-
-Idle memory does not change with these settings; buffers grow during
-transfers. A larger `stream_window` costs nothing while the receiver keeps
-up, but a stream whose receiver is slow or paused can hold up to the whole
-window: a proxied upload to a slow host, or a handler using
-`cft_stream_pause_body()`. With `max_origin_connections` uploads at a time,
-that is up to that many windows. `examples/tunnel_ethernet` uses PSRAM (see
-above), lwIP 32768
-and a 128 KiB window; both are in its `sdkconfig.defaults` and menuconfig.
-
-## How it works
-
-- The edge address comes from `region1.v2.argotunnel.com` /
-  `region2.v2.argotunnel.com`, port 7844 (the targets of the
-  `_v2-origintunneld._tcp.argotunnel.com` SRV record).
-- TLS 1.3 with SNI `h2.cftunnel.com`. The certificate is signed by the
-  Cloudflare Origin SSL ECC CA, which is embedded in `src/cft_ca.h`.
-- The device is the TLS client but the HTTP/2 *server*: the edge opens the
-  streams. The first one is the control stream, carrying Cap'n Proto RPC: the
-  device calls `RegistrationServer.registerConnection` with the token's
-  account tag, tunnel ID and secret (`src/cft_rpc.c`).
-- The edge then sends configuration updates (JSON) and one stream per visitor
-  request. Response headers are also sent base64-encoded in
-  `cf-cloudflared-response-headers` (`src/cft_conn.c`).
-
-`src/` holds the portable core: `cft_conn.c` handles one connection and does
-no I/O, `cft_tunnel.c` supervises the connections over a `cft_transport_ops_t`
-and routes requests (`cft_ingress.c`), and `cft_proxy.c` talks to other hosts
-over non-blocking sockets in the same select loop (`cft_poll.c`).
-`port/esp/` provides the transport (mbedTLS over a non-blocking lwIP socket) and runs the tunnel in a task.
-
-### Edge behaviour worth knowing
-
-- The edge's GOAWAY carries one of its own stream IDs as `last_stream_id`.
-  nghttp2 rejects that, so `cft_conn.c` rewrites the field to 0 on receive.
-- The edge does not queue requests when the connector's
-  SETTINGS_MAX_CONCURRENT_STREAMS is reached: it sends GOAWAY and fails the
-  pending requests with 502. cloudflared advertises no limit, so we don't
-  either; requests over `max_concurrent_streams` get 503 from the connector.
-- Remotely managed tunnels get a configuration push on connection index 0.
-  The connector itself enforces the ingress rules: the edge sends it every
-  request routed to the tunnel, whatever the hostname's service.
-
-## Layout
-
-- `include/`, `src/`, `port/esp/`: the component
-- `examples/tunnel_ethernet/`: Ethernet example serving a status page with
-  live updates over a WebSocket (pin defaults for the ESP32-P4 Function EV
-  Board)
-- `test_apps/common/`: request handlers shared by the host runner and the
-  device test app
-- `test_apps/host/`: Linux runner (OpenSSL), RPC test, mock server, fake edge
-  and the host tests
-- `test_apps/device/`: device test app for the stress test (Ethernet, heap
-  checks, network outages on request)
-- `test_apps/stress/`: stress test load generator and LAN origin services
-- `tools/capnp_layout.py`: prints the Cap'n Proto struct layouts used in
-  `src/cft_rpc.c`
+Idle heap usage does not change with these window settings; buffers grow only while transfers are active. `examples/tunnel_ethernet` configures PSRAM, 32 KiB lwIP windows, and a 128 KiB `stream_window` in its `sdkconfig.defaults` and `Kconfig.projbuild`.
 
 ## Example
 
-`examples/tunnel_ethernet` reads the token from a `.env` file in the example
-directory using [nvs-dotenv](https://components.espressif.com/components/igrr/nvs-dotenv):
-the build turns `.env` into an image for the `dotenv` NVS partition, and
-`idf.py flash` writes it together with the app.
+`examples/tunnel_ethernet` reads the tunnel token from a `.env` file in the example directory using [nvs-dotenv](https://components.espressif.com/components/igrr/nvs-dotenv). The build packs `.env` into an NVS partition image (`dotenv`), and `idf.py flash` writes it to the device alongside the application.
 
 ```sh
 cd examples/tunnel_ethernet
@@ -302,100 +119,18 @@ cp .env.example .env    # then set TUNNEL_TOKEN
 idf.py build flash monitor
 ```
 
-`.env` is ignored by git. `TUNNEL_TOKEN` is the variable cloudflared reads
-the token from, too.
+`.env` is ignored by git. `TUNNEL_TOKEN` is the same environment variable name used by `cloudflared`.
 
-## Host runner
+## Development and Testing
 
-Needs OpenSSL and nghttp2 development files.
-
-```sh
-cmake -S test_apps/host -B test_apps/host/build -G Ninja
-cmake --build test_apps/host/build
-test_apps/host/build/cft_host --token-file tunnel.token
-```
-
-Requests routed to the tunnel are answered by the demo endpoints in
-`test_apps/host/main.c` (`/echo`, `/upload`, `/pause`, `/big?size=N`,
-`/later`, `/ws`, and a page showing the request for anything else). Ctrl-C
-unregisters the connections. Options: `--connections N`, `--connector-id
-UUID`, `--edge HOST[:PORT]`, `--plain` (no TLS, for the fake edge),
-`--handler-delay-ms N`, `--max-streams N`, `--ingress` (route by the
-dashboard's public hostnames, proxying to other hosts), `--max-origins N`,
-`--stream-window N`, `--proxy-buffer N`, `-v`.
-
-## Host tests
-
-`test_apps/host/test_host.py` and `test_proxy.py` run the host tests:
-
-- the registration RPC client against a mock server built on the reference
-  Cap'n Proto implementation (pycapnp), with schemas in `test_apps/host/schemas`;
-- the host runner against `fake_edge.py`, which plays the edge's side of the
-  protocol (HTTP/2 client, control stream, registration, configuration
-  pushes, drains, lost and unresponsive connections), covering streamed
-  bodies and WebSockets too. The connector runs with AddressSanitizer and
-  UndefinedBehaviorSanitizer, and a leak check at exit;
-- proxying by ingress rules to HTTP, WebSocket and TCP origins on 127.0.0.2,
-  standing in for other hosts;
-- `test_chaos.py`: random concurrent operations of every kind for 30 s
-  (`CFT_CHAOS_SECONDS` for longer), with visitors that leave mid-transfer and
-  connections that are lost, drained or stop answering. At the end, every
-  stream must have been closed. A second run makes allocations fail at
-  random (`fault.c`): the connector must survive without leaks or stuck
-  streams and serve normally afterwards.
-
-```sh
-pip install pytest pycapnp h2
-pytest test_apps/host
-```
-
-To check the thread-safe paths (`cft_tunnel_post()`), build with
-`-DCMAKE_C_FLAGS=-fsanitize=thread` into another directory and point
-`CFT_HOST_BUILD` at it.
-
-## Stress test
-
-`test_apps/stress/load.py` runs a mix of operations against
-`test_apps/device` through the real edge for hours: concurrent bursts, long
-and abandoned downloads and uploads, slow readers, WebSockets (echo, server
-push, long-lived, dropped), answers from another thread, streams the device
-resets, HTTP and `cloudflared access tcp` proxied to `origin.py` on another
-LAN host (including origins that fail), and Ethernet outages. It verifies
-every response, separates failures during outages, requests the device sheds
-(503) and errors from the edge itself, and records the device's heap at quiet
-checkpoints, so leaks show as a trend. The device app is built with heap
-poisoning, stack checks and component memory counters; `sdkconfig.psram` adds
-the example's PSRAM settings. `analyze.py` relates the failures to what the
-device logged.
-
-With a macOS host as the TCP origin, a few TCP-over-WebSocket transfers per
-half hour stalled below the component: the device had nothing to read and
-the origin had data queued for it that never arrived. The proxy gives up on
-such a transfer after 30 s and logs the stream's flow-control state. With a
-Linux origin it did not happen.
-
-```sh
-# on another LAN host
-python3 test_apps/stress/origin.py 192.168.1.10
-# device: set TUNNEL_TOKEN and the LAN_* services in test_apps/device/.env
-idf.py -C test_apps/device build flash monitor
-# load, from anywhere
-uv run --with httpx --with websockets test_apps/stress/load.py \
-    --url https://your-hostname --duration 10800 --out stress-out
-```
+For internal protocol details, repository layout, the Linux host runner, sanitizer and fault-injection tests, and the hardware stress test suite, see [docs/development.md](docs/development.md).
 
 ## Contributing
 
-1. Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/);
-   [commitizen](https://commitizen-tools.github.io/commitizen/) (`cz commit`)
-   helps with the format.
-2. Install the pre-commit hooks before making changes: `pre-commit install`.
-   They format C code with astyle and regenerate [API.md](API.md) from the
-   public headers (needs doxygen).
-3. Releases: `cz bump` updates CHANGELOG.md and tags the version; pushing a
-   `v*` tag publishes the component to the ESP Component Registry.
+1. Format commit messages according to [Conventional Commits](https://www.conventionalcommits.org/); [commitizen](https://commitizen-tools.github.io/commitizen/) (`cz commit`) can generate them.
+2. Install the pre-commit hooks before making changes: `pre-commit install`. The hooks format C source files with `astyle` and regenerate [API.md](API.md) from the public headers using Doxygen.
+3. Run `cz bump` to update `CHANGELOG.md` and tag a release; pushing a `v*` tag triggers the GitHub Actions workflow that publishes the component to the ESP Component Registry.
 
 ## License
 
-Apache 2.0, see [LICENSE.txt](LICENSE.txt). The Cap'n Proto schemas in
-`test_apps/host/schemas` keep their own licenses (see the README there).
+Apache 2.0, see [LICENSE.txt](LICENSE.txt). The Cap'n Proto schemas in `test_apps/host/schemas` retain their upstream licenses (see `test_apps/host/schemas/README.md`).

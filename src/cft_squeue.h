@@ -1,8 +1,7 @@
 /*
- * Byte queue in fixed-size segments (internal): data waiting to be sent,
- * which can grow to tens of kilobytes. Unlike a buffer that doubles, it
- * never needs a large contiguous block, which a fragmented heap may not
- * have.
+ * Byte queue in fixed-size segments (internal): queues outgoing bytes in
+ * 256 B to 4 KiB segments to avoid large contiguous allocations on a
+ * fragmented heap.
  */
 #pragma once
 

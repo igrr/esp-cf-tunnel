@@ -1,5 +1,5 @@
 """Randomized stress against the fake edge: many concurrent operations of
-every kind, visitors that go away mid-transfer, and connections that are
+every kind, clients that disconnect mid-transfer, and connections that are
 lost, drained or stop answering. The connector runs under the sanitizers
 (see conftest.py), so memory errors and leaks fail the test.
 
@@ -37,7 +37,7 @@ def fnv(data):
 
 
 class Interrupted(Exception):
-    """The connection went away during the operation; not a failure"""
+    """The connection closed during the operation; not a failure"""
 
 
 class Shed(Exception):
@@ -78,7 +78,7 @@ class Chaos:
         return conn.streams[sid].resp
 
     async def cancel_after(self, conn, sid, nbytes, timeout=15):
-        """Waits for nbytes of response, then resets the stream like a departing visitor"""
+        """Waits for nbytes of response, then resets the stream simulating a client disconnect"""
         s = conn.streams[sid]
         got = 0
         while got < nbytes and not s.done.is_set():
@@ -350,7 +350,7 @@ def run_chaos(edge, connector, origins, duration, env):  # noqa: F811
     else:
         assert not chaos.failures, "\n".join(chaos.failures[:20])
 
-    # Quiet now: every stream the handlers saw must have been closed
+    # After traffic stops, all streams must be closed
     time.sleep(5)  # silent and draining connections close
     edge.wait_registered(1)
     conn = chaos.live()[0]
