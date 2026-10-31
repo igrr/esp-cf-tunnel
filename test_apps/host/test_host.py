@@ -354,6 +354,25 @@ def test_websocket_message_limit(edge, connector):
     assert op == 8 and int.from_bytes(payload[:2], "big") == 1009
 
 
+@pytest.mark.parametrize("length", [2**64 - 1, 2**63], ids=["wraps", "msb"])
+def test_websocket_64bit_length(edge, connector, length):
+    """A continuation frame with a 64-bit length that has the top bit set is a protocol error.
+    2**64 - 1 plus the 1 byte already buffered wraps to 0 in uint64."""
+    connector()
+    [conn] = edge.wait_registered()
+
+    async def session():
+        sid, _ = ws_open(conn)
+        s = conn.streams[sid]
+        await asyncio.wait_for(s.headers_received.wait(), 5)
+        r = WsReader(s)
+        conn.send_body(sid, ws_frame(1, b"a", fin=False) + ws_frame(0, b"x" * 4096, length=length))
+        return await r.frame()
+
+    op, payload = edge.call(session())
+    assert op == 8 and int.from_bytes(payload[:2], "big") == 1002
+
+
 # --- input validation of data from the edge ---
 
 def test_config_version_overflow(edge, connector):

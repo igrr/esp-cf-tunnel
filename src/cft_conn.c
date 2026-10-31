@@ -772,6 +772,10 @@ static void ws_feed(cft_stream_t *s, const uint8_t *data, size_t len)
             }
             w->hdr_need = 0;
             w->hdr_len = 0;
+            if (plen >> 63) {
+                ws_fail(s, 1002, "invalid frame length");
+                return;
+            }
             if (!(w->hdr[1] & 0x80)) {
                 ws_fail(s, 1002, "unmasked frame from client");
                 return;
@@ -789,7 +793,8 @@ static void ws_feed(cft_stream_t *s, const uint8_t *data, size_t len)
                 if (w->opcode) {
                     w->msg_opcode = w->opcode;
                 }
-                if (!s->ws_raw && w->msg.len + plen > max) {
+                /* msg.len <= max: only frames that passed this check were added to msg */
+                if (!s->ws_raw && plen > max - w->msg.len) {
                     ws_fail(s, 1009, "message too big");
                     return;
                 }

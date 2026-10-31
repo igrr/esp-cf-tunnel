@@ -346,10 +346,10 @@ class FakeEdge:
 
 # --- WebSocket helpers (the visitor side) ---
 
-def ws_frame(opcode, payload, fin=True, mask=b"\x01\x02\x03\x04"):
-    """Masked client frame"""
+def ws_frame(opcode, payload, fin=True, mask=b"\x01\x02\x03\x04", length=None):
+    """Masked client frame. length, if given, goes into the header in place of len(payload)."""
     hdr = bytes([(0x80 if fin else 0) | opcode])
-    n = len(payload)
+    n = len(payload) if length is None else length
     if n < 126:
         hdr += bytes([0x80 | n])
     elif n < 65536:
