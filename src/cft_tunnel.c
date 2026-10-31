@@ -104,6 +104,10 @@ static void route_request(void *arg, cft_stream_t *s, const cft_request_t *req)
 {
     cft_tunnel_t *t = arg;
     const cft_ingress_rule_t *rule = t->ingress ? cft_ingress_match(t->ingress, req->authority, req->path) : NULL;
+    if (rule && !rule->service) {
+        cft_stream_fail(s, 502);
+        return;
+    }
     if (rule && !(t->cfg.on_request && cft_ingress_is_local(rule->service))) {
         if (cft_proxy_start(s, rule->service, rule->host_header) < 0) {
             cft_stream_fail(s, 502);

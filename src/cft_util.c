@@ -159,38 +159,40 @@ static bool json_skip_value(json_cur_t *c)
     return true;
 }
 
+typedef enum { FIND_OK, FIND_MISSING, FIND_ERROR } find_result_t;
+
 /* Positions the cursor at the value of top-level member `key`. */
-static bool json_find(const char *json, size_t len, const char *key, json_cur_t *c)
+static find_result_t json_find(const char *json, size_t len, const char *key, json_cur_t *c)
 {
     c->p = json;
     c->end = json + len;
     size_t klen = strlen(key);
     json_ws(c);
     if (c->p >= c->end || *c->p != '{') {
-        return false;
+        return FIND_ERROR;
     }
     c->p++;
     for (;;) {
         json_ws(c);
         if (c->p < c->end && *c->p == '}') {
-            return false;
+            return FIND_MISSING;
         }
         const char *k;
         size_t kl;
         if (!json_skip_string(c, &k, &kl)) {
-            return false;
+            return FIND_ERROR;
         }
         json_ws(c);
         if (c->p >= c->end || *c->p != ':') {
-            return false;
+            return FIND_ERROR;
         }
         c->p++;
         json_ws(c);
         if (kl == klen && memcmp(k, key, klen) == 0) {
-            return true;
+            return FIND_OK;
         }
         if (!json_skip_value(c)) {
-            return false;
+            return FIND_ERROR;
         }
         json_ws(c);
         if (c->p < c->end && *c->p == ',') {
@@ -199,45 +201,128 @@ static bool json_find(const char *json, size_t len, const char *key, json_cur_t 
     }
 }
 
-bool cft_json_get_string(const char *json, size_t len, const char *key, char *out, size_t out_size)
+static int hexval(char c);
+
+/* Value of 4 hex digits, or -1 */
+static long hex4(const char *s, size_t avail)
 {
-    json_cur_t c;
-    if (!json_find(json, len, key, &c)) {
-        return false;
+    if (avail < 4) {
+        return -1;
     }
-    const char *s;
-    size_t sl;
-    if (!json_skip_string(&c, &s, &sl)) {
-        return false;
+    long v = 0;
+    for (int i = 0; i < 4; i++) {
+        int d = hexval(s[i]);
+        if (d < 0) {
+            return -1;
+        }
+        v = v << 4 | d;
     }
+    return v;
+}
+
+static size_t utf8_encode(uint32_t cp, char out[4])
+{
+    if (cp < 0x80) {
+        out[0] = (char)cp;
+        return 1;
+    }
+    if (cp < 0x800) {
+        out[0] = (char)(0xc0 | cp >> 6);
+        out[1] = (char)(0x80 | (cp & 0x3f));
+        return 2;
+    }
+    if (cp < 0x10000) {
+        out[0] = (char)(0xe0 | cp >> 12);
+        out[1] = (char)(0x80 | (cp >> 6 & 0x3f));
+        out[2] = (char)(0x80 | (cp & 0x3f));
+        return 3;
+    }
+    out[0] = (char)(0xf0 | cp >> 18);
+    out[1] = (char)(0x80 | (cp >> 12 & 0x3f));
+    out[2] = (char)(0x80 | (cp >> 6 & 0x3f));
+    out[3] = (char)(0x80 | (cp & 0x3f));
+    return 4;
+}
+
+/* Decodes the contents of a string (between the quotes) to UTF-8. False on a
+ * bad escape, \u0000, an unpaired surrogate, or if out is too small. */
+static bool json_unescape(const char *s, size_t sl, char *out, size_t out_size)
+{
     size_t n = 0;
     for (size_t i = 0; i < sl; i++) {
-        char ch = s[i];
-        if (ch == '\\' && i + 1 < sl) {
-            char e = s[++i];
-            switch (e) {
-            case 'n': ch = '\n'; break;
-            case 't': ch = '\t'; break;
-            case 'r': ch = '\r'; break;
-            case 'b': ch = '\b'; break;
-            case 'f': ch = '\f'; break;
-            case 'u': return false; /* not needed for the fields we read */
-            default: ch = e; break;
+        char buf[4] = {s[i]};
+        size_t bn = 1;
+        if (s[i] == '\\') {
+            if (++i >= sl) {
+                return false;
+            }
+            switch (s[i]) {
+            case '"': case '\\': case '/': buf[0] = s[i]; break;
+            case 'n': buf[0] = '\n'; break;
+            case 't': buf[0] = '\t'; break;
+            case 'r': buf[0] = '\r'; break;
+            case 'b': buf[0] = '\b'; break;
+            case 'f': buf[0] = '\f'; break;
+            case 'u': {
+                long cp = hex4(s + i + 1, sl - i - 1);
+                if (cp < 0) {
+                    return false;
+                }
+                i += 4;
+                if (cp >= 0xd800 && cp <= 0xdbff && i + 2 < sl && s[i + 1] == '\\' && s[i + 2] == 'u') {
+                    long lo = hex4(s + i + 3, sl - i - 3);
+                    if (lo >= 0xdc00 && lo <= 0xdfff) {
+                        cp = 0x10000 + ((cp - 0xd800) << 10) + (lo - 0xdc00);
+                        i += 6;
+                    }
+                }
+                if (cp == 0 || (cp >= 0xd800 && cp <= 0xdfff)) {
+                    return false;
+                }
+                bn = utf8_encode((uint32_t)cp, buf);
+                break;
+            }
+            default:
+                return false;
             }
         }
-        if (n + 1 >= out_size) {
+        if (n + bn >= out_size) {
             return false;
         }
-        out[n++] = ch;
+        memcpy(out + n, buf, bn);
+        n += bn;
     }
     out[n] = '\0';
     return true;
 }
 
+int cft_json_read_string(const char *json, size_t len, const char *key, char *out, size_t out_size)
+{
+    json_cur_t c;
+    find_result_t f = json_find(json, len, key, &c);
+    if (f != FIND_OK) {
+        return f == FIND_MISSING ? 0 : -1;
+    }
+    if (c.end - c.p >= 4 && memcmp(c.p, "null", 4) == 0) {
+        return 0;
+    }
+    const char *s;
+    size_t sl;
+    if (!json_skip_string(&c, &s, &sl) || !json_unescape(s, sl, out, out_size)) {
+        return -1;
+    }
+    return 1;
+}
+
+bool cft_json_get_string(const char *json, size_t len, const char *key, char *out, size_t out_size)
+{
+    return cft_json_read_string(json, len, key, out, out_size) > 0;
+}
+
 bool cft_json_get_int(const char *json, size_t len, const char *key, int64_t *out)
 {
     json_cur_t c;
-    if (!json_find(json, len, key, &c)) {
+    if (json_find(json, len, key, &c) != FIND_OK) {
         return false;
     }
     bool neg = false;
@@ -264,7 +349,7 @@ bool cft_json_get_int(const char *json, size_t len, const char *key, int64_t *ou
 bool cft_json_get_raw(const char *json, size_t len, const char *key, const char **value, size_t *value_len)
 {
     json_cur_t c;
-    if (!json_find(json, len, key, &c)) {
+    if (json_find(json, len, key, &c) != FIND_OK) {
         return false;
     }
     const char *start = c.p;

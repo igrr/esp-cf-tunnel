@@ -71,7 +71,7 @@ cft_tunnel_config_t cfg = {
 };
 ```
 
-Hostname wildcards (`*.example.com`), path regular expressions (POSIX extended syntax), and `httpHostHeader` overrides work as in `cloudflared`. Before the initial configuration arrives from the edge, all requests go to `on_request`. A request handler can also forward an individual stream by calling `cft_stream_proxy(s, "http://...")`.
+Hostname wildcards (`*.example.com`), path regular expressions (POSIX extended syntax), and `httpHostHeader` overrides work as in `cloudflared`. A rule whose hostname or path the connector cannot read (longer than 255 bytes, or not a string) never matches; a rule whose service or `httpHostHeader` it cannot read answers HTTP 502. Before the initial configuration arrives from the edge, all requests go to `on_request`. A request handler can also forward an individual stream by calling `cft_stream_proxy(s, "http://...")`.
 
 Each proxied request opens a separate TCP connection to the origin, up to `max_origin_connections` concurrent connections (default 4; additional requests receive HTTP 503). When an origin reads slowly, the proxy pauses the incoming request body through HTTP/2 stream flow control (`cft_stream_pause_body()`, which is also available to local request handlers). Origins using `https://` or `wss://`, Unix domain sockets, `cloudflared` built-in services, and private network routing (WARP) are not supported. Resolving hostnames in service URLs blocks the tunnel task during DNS lookup; using IP addresses avoids this delay.
 

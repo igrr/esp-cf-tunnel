@@ -75,3 +75,8 @@ add_executable(rpc_test rpc_test.c)
 target_include_directories(rpc_test PRIVATE ${CORE_DIR}/src)
 target_link_libraries(rpc_test cf_tunnel)
 cft_warnings(rpc_test)
+
+add_executable(util_test util_test.c)
+target_include_directories(util_test PRIVATE ${CORE_DIR}/src)
+target_link_libraries(util_test cf_tunnel)
+cft_warnings(util_test)

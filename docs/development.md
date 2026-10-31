@@ -54,8 +54,9 @@ Command-line options: `--connections N`, `--connector-id UUID`, `--edge HOST[:PO
 
 ## Host Tests
 
-`test_apps/host/test_host.py` and `test_apps/host/test_proxy.py` run the automated host test suite:
+The `test_*.py` files in `test_apps/host` run the automated host test suite:
 
+- Unit tests of the JSON string reader (`util_test.c`, run by `test_util.py`).
 - Registration RPC client tests against `mock_registration_server.py`, which uses the reference Cap'n Proto implementation (`pycapnp`) and the schemas in `test_apps/host/schemas`.
 - End-to-end connector tests against `fake_edge.py`, which implements the edge side of the HTTP/2 protocol (control stream, registration, configuration updates, connection draining, connection drops, and unresponsive connections) across HTTP requests, streamed bodies, and WebSockets. With the build above, the connector runs under AddressSanitizer, UndefinedBehaviorSanitizer, and LeakSanitizer, and the tests fail on any sanitizer report.
 - Ingress routing and proxy tests against HTTP, WebSocket, and TCP origins listening on `127.0.0.2`.

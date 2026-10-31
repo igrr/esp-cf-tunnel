@@ -9,7 +9,9 @@
 #include <stddef.h>
 
 typedef struct {
-    const char *service;     /* e.g. "http://192.168.1.10:8080", "ssh://10.0.0.2:22", "http_status:404" */
+    /* e.g. "http://192.168.1.10:8080", "ssh://10.0.0.2:22", "http_status:404"; NULL if the
+     * rule's service or host header could not be read: answer 502 */
+    const char *service;
     const char *host_header; /* originRequest.httpHostHeader, or NULL */
 } cft_ingress_rule_t;
 

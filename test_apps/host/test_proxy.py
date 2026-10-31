@@ -15,7 +15,7 @@ import time
 
 import pytest
 
-from fake_edge import WsReader, ws_frame, ws_open
+from fake_edge import UPGRADE, WsReader, ws_frame, ws_open
 
 ORIGIN_HOST = "127.0.0.2"
 
@@ -470,3 +470,71 @@ def test_proxy_bad_service(edge, tunnel, service):
     edge.push_config(conn, 2, {"ingress": [{"service": service}], "warp-routing": {"enabled": False}})
     resp = edge.request(conn, "GET", "/", authority="whatever.example.com")
     assert resp.status == 502
+
+
+def push_go_config(edge, conn, version, rules):
+    """Pushes rules encoded as Go's encoding/json writes them: <, > and & as \\u escapes.
+    A backslash followed by u in a string is sent as is, to test malformed escapes."""
+    text = json.dumps({"version": version, "config": {"ingress": rules, "warp-routing": {"enabled": False}}})
+    text = text.replace("\\\\u", "\\u")
+    for ch in "<>&":
+        text = text.replace(ch, f"\\u{ord(ch):04x}")
+    resp = edge.request(conn, "PUT", "/", [(UPGRADE, "update-configuration")], text.encode())
+    assert json.loads(resp.body) == {"lastAppliedVersion": version, "err": None}
+
+
+def test_ingress_escaped_path(edge, tunnel, origins):
+    http = f"http://{ORIGIN_HOST}:{origins['http'].port}"
+    conn = tunnel()
+    push_go_config(edge, conn, 2, [
+        {"hostname": "esc.example.com", "path": "^/a<b>&c$", "service": http},
+        {"hostname": "esc.example.com", "path": "^/\U0001f600$", "service": http},  # a surrogate pair
+        {"hostname": "esc.example.com", "service": "http_status:403"},
+        {"service": "http_status:418"},
+    ])
+    assert info(edge.request(conn, "GET", "/a%3Cb%3E&c", authority="esc.example.com"))["target"] == "/a%3Cb%3E&c"
+    assert info(edge.request(conn, "GET", "/%F0%9F%98%80", authority="esc.example.com"))["target"] == "/%F0%9F%98%80"
+    assert edge.request(conn, "GET", "/other", authority="esc.example.com").status == 403
+
+
+def test_ingress_unreadable_match_fields(edge, tunnel, origins):
+    """A rule whose hostname or path cannot be read never matches; an empty or null one matches anything"""
+    http = f"http://{ORIGIN_HOST}:{origins['http'].port}"
+    conn = tunnel()
+    push_go_config(edge, conn, 2, [
+        {"hostname": "a" * 300 + ".example.com", "service": http},
+        {"hostname": "long.example.com", "path": "^/" + "x" * 300, "service": http},
+        {"hostname": "long.example.com", "service": "http_status:403"},
+        {"hostname": "num.example.com", "path": 5, "service": http},
+        {"hostname": "num.example.com", "service": "http_status:403"},
+        {"hostname": "bad.example.com", "path": "^/\\u12", "service": http},
+        {"hostname": "bad.example.com", "path": "^/\\u0000", "service": http},
+        {"hostname": "bad.example.com", "path": "^/\\ud800", "service": http},
+        {"hostname": "bad.example.com", "service": "http_status:403"},
+        {"hostname": "null.example.com", "path": None, "service": http},
+        {"hostname": "empty.example.com", "path": "", "service": http},
+        {"service": "http_status:418"},
+    ])
+    assert edge.request(conn, "GET", "/" + "x" * 300, authority="long.example.com").status == 403
+    assert edge.request(conn, "GET", "/", authority="long.example.com").status == 403
+    assert edge.request(conn, "GET", "/", authority="num.example.com").status == 403
+    assert edge.request(conn, "GET", "/", authority="bad.example.com").status == 403
+    assert edge.request(conn, "GET", "/", authority="other.example.com").status == 418
+    assert info(edge.request(conn, "GET", "/p", authority="null.example.com"))["target"] == "/p"
+    assert info(edge.request(conn, "GET", "/p", authority="empty.example.com"))["target"] == "/p"
+
+
+def test_ingress_unreadable_service(edge, tunnel, origins):
+    """A rule whose service or host header cannot be read answers 502 for its requests"""
+    http = f"http://{ORIGIN_HOST}:{origins['http'].port}"
+    conn = tunnel()
+    push_go_config(edge, conn, 2, [
+        {"hostname": "long.example.com", "service": http + "/" + "x" * 300},
+        {"hostname": "num.example.com", "service": 5},
+        {"hostname": "none.example.com"},
+        {"hostname": "hdr.example.com", "service": http, "originRequest": {"httpHostHeader": "h" * 300}},
+        {"service": http},
+    ])
+    for host in ("long", "num", "none", "hdr"):
+        assert edge.request(conn, "GET", "/", authority=f"{host}.example.com").status == 502, host
+    assert info(edge.request(conn, "GET", "/", authority="other.example.com"))["target"] == "/"

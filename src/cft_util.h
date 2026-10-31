@@ -28,6 +28,10 @@ int cft_b64_decode(const char *in, size_t len, uint8_t *out, size_t out_size);
  * wrong type.
  */
 bool cft_json_get_string(const char *json, size_t len, const char *key, char *out, size_t out_size);
+/* Reads a string member, decoding escapes (\u to UTF-8). Returns 1 if it was
+ * read, 0 if the key is missing or null, -1 otherwise (not a string, a bad
+ * escape or \u0000, too long for out, or malformed JSON). */
+int cft_json_read_string(const char *json, size_t len, const char *key, char *out, size_t out_size);
 bool cft_json_get_int(const char *json, size_t len, const char *key, int64_t *out);
 /* Raw text of a member's value (object, array, string with quotes, ...). */
 bool cft_json_get_raw(const char *json, size_t len, const char *key, const char **value, size_t *value_len);

@@ -17,7 +17,7 @@ typedef struct {
     char *hostname; /* NULL or "*" matches any host; "*.example.com" any subdomain */
     regex_t path;   /* POSIX extended regex, searched like Go's MatchString */
     bool has_path;
-    bool broken;    /* path regex did not compile: never matches */
+    bool broken;    /* hostname or path unreadable, or regex did not compile: never matches */
 } rule_t;
 
 struct cft_ingress {
@@ -25,24 +25,34 @@ struct cft_ingress {
     size_t num_rules;
 };
 
-static char *get_str(const char *json, size_t len, const char *key)
+/* Sets *out to a copy of the string member, or NULL if it is missing, null
+ * or empty (cloudflared treats those alike). Returns false if the member is
+ * present but cannot be read, or memory runs out. */
+static bool get_str(const char *json, size_t len, const char *key, char **out)
 {
     char buf[MAX_FIELD];
-    if (!cft_json_get_string(json, len, key, buf, sizeof(buf)) || buf[0] == '\0') {
-        return NULL;
+    *out = NULL;
+    int rv = cft_json_read_string(json, len, key, buf, sizeof(buf));
+    if (rv < 0) {
+        return false;
     }
-    return strdup(buf);
+    if (rv == 0 || buf[0] == '\0') {
+        return true;
+    }
+    *out = strdup(buf);
+    return *out != NULL;
 }
 
-/* originRequest.httpHostHeader of an object, or NULL */
-static char *get_host_header(const char *json, size_t len)
+/* originRequest.httpHostHeader of an object, as get_str() */
+static bool get_host_header(const char *json, size_t len, char **out)
 {
     const char *orq;
     size_t orq_len;
     if (!cft_json_get_raw(json, len, "originRequest", &orq, &orq_len)) {
-        return NULL;
+        *out = NULL;
+        return true;
     }
-    return get_str(orq, orq_len, "httpHostHeader");
+    return get_str(orq, orq_len, "httpHostHeader", out);
 }
 
 static void rule_free(rule_t *r)
@@ -67,34 +77,51 @@ void cft_ingress_free(cft_ingress_t *ing)
     free(ing);
 }
 
-static bool parse_rule(const char *json, size_t len, const char *default_host_header, rule_t *r)
+/* A rule whose hostname or path cannot be read never matches. A rule whose
+ * service or host header cannot be read matches with service NULL, so its
+ * requests get 502 and do not reach a later rule. */
+static void parse_rule(const char *json, size_t len, size_t idx, bool default_ok, const char *default_host_header,
+                       rule_t *r)
 {
     memset(r, 0, sizeof(*r));
-    char *service = get_str(json, len, "service");
-    if (!service) {
-        CFT_LOGW(TAG, "ingress rule without a service");
-        return false;
+    if (!get_str(json, len, "hostname", &r->hostname)) {
+        CFT_LOGW(TAG, "ingress rule %u: cannot read the hostname; the rule will not match", (unsigned)idx);
+        r->broken = true;
     }
-    r->pub.service = service;
-    r->hostname = get_str(json, len, "hostname");
-    char *host_header = get_host_header(json, len);
-    if (!host_header && default_host_header) {
-        host_header = strdup(default_host_header);
-    }
-    r->pub.host_header = host_header;
-    char *path = get_str(json, len, "path");
-    if (path) {
-        int rv = regcomp(&r->path, path, REG_EXTENDED | REG_NOSUB);
-        if (rv == 0) {
+    const char *host = r->hostname ? r->hostname : "*";
+    char *path;
+    if (!get_str(json, len, "path", &path)) {
+        CFT_LOGW(TAG, "ingress rule %u (%s): cannot read the path; the rule will not match", (unsigned)idx, host);
+        r->broken = true;
+    } else if (path) {
+        if (regcomp(&r->path, path, REG_EXTENDED | REG_NOSUB) == 0) {
             r->has_path = true;
         } else {
-            CFT_LOGW(TAG, "path regex '%s' not supported; the rule for %s will not match", path,
-                     r->hostname ? r->hostname : "*");
+            CFT_LOGW(TAG, "path regex '%s' not supported; the rule for %s will not match", path, host);
             r->broken = true;
         }
         free(path);
     }
-    return true;
+
+    char *service;
+    char *host_header;
+    bool ok = get_str(json, len, "service", &service);
+    if (!get_host_header(json, len, &host_header)) {
+        ok = false;
+    } else if (!host_header && !default_ok) {
+        ok = false;
+    } else if (!host_header && default_host_header) {
+        host_header = strdup(default_host_header);
+        ok = ok && host_header;
+    }
+    if (!ok || !service) {
+        CFT_LOGW(TAG, "ingress rule %u (%s): cannot read the service or host header; it will answer 502",
+                 (unsigned)idx, host);
+        free(service);
+        service = NULL;
+    }
+    r->pub.service = service;
+    r->pub.host_header = host_header;
 }
 
 cft_ingress_t *cft_ingress_parse(const char *json, size_t len)
@@ -108,7 +135,11 @@ cft_ingress_t *cft_ingress_parse(const char *json, size_t len)
     if (!ing) {
         return NULL;
     }
-    char *default_host_header = get_host_header(json, len);
+    char *default_host_header;
+    bool default_ok = get_host_header(json, len, &default_host_header);
+    if (!default_ok) {
+        CFT_LOGW(TAG, "cannot read the default host header");
+    }
     const char *pos = NULL;
     const char *elem;
     size_t elem_len;
@@ -123,10 +154,9 @@ cft_ingress_t *cft_ingress_parse(const char *json, size_t len)
         return NULL;
     }
     pos = NULL;
-    while (cft_json_array_next(list, list_len, &pos, &elem, &elem_len)) {
-        if (parse_rule(elem, elem_len, default_host_header, &ing->rules[ing->num_rules])) {
-            ing->num_rules++;
-        }
+    while (ing->num_rules < n && cft_json_array_next(list, list_len, &pos, &elem, &elem_len)) {
+        parse_rule(elem, elem_len, ing->num_rules, default_ok, default_host_header, &ing->rules[ing->num_rules]);
+        ing->num_rules++;
     }
     free(default_host_header);
     if (ing->num_rules == 0) {
