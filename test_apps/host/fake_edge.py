@@ -81,6 +81,7 @@ class EdgeConn:
         self.h2 = h2.connection.H2Connection(h2.config.H2Configuration(client_side=True, header_encoding="utf-8"))
         self.streams = {}
         self.pending = {}  # stream id -> [unsent data, end_stream]
+        self.unacked = {}  # stream id -> received bytes not yet acknowledged with WINDOW_UPDATE
         self.registration = None
         self.registered = asyncio.Event()
         self.unregistered = asyncio.Event()
@@ -157,7 +158,10 @@ class EdgeConn:
                 s.resp.status = int(s.resp.headers[":status"])
                 s.headers_received.set()
         elif isinstance(ev, h2.events.DataReceived):
-            self.h2.acknowledge_received_data(ev.flow_controlled_length, ev.stream_id)
+            if ev.stream_id in self.unacked:
+                self.unacked[ev.stream_id] += ev.flow_controlled_length
+            else:
+                self.h2.acknowledge_received_data(ev.flow_controlled_length, ev.stream_id)
             if ev.stream_id == self.control_id:
                 self.rpc_writer.write(ev.data)
             elif ev.stream_id in self.streams:
@@ -231,6 +235,16 @@ class EdgeConn:
         self.flush()
         frame = hyperframe.frame.GoAwayFrame(0, last_stream_id=max(self.streams) if self.streams else 1)
         self.writer.write(frame.serialize())
+
+    def hold_window(self, sid):
+        """Stops sending WINDOW_UPDATE for data received on the stream"""
+        self.unacked.setdefault(sid, 0)
+
+    def release_window(self, sid):
+        n = self.unacked.pop(sid, 0)
+        if n:
+            self.h2.acknowledge_received_data(n, sid)
+            self.flush()
 
     def abort(self):
         self.writer.transport.abort()

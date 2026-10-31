@@ -697,12 +697,19 @@ static void ws_fail(cft_stream_t *s, uint16_t code, const char *why)
     cft_ws_close(s, code, why);
 }
 
+/* Largest incoming message; PINGs get no PONG while more than this is queued for output */
+static size_t ws_limit(cft_stream_t *s)
+{
+    return s->conn->cfg.max_request_body ? s->conn->cfg.max_request_body : DEFAULT_MAX_BODY;
+}
+
 static void ws_frame_done(cft_stream_t *s)
 {
     ws_rx_t *w = &s->wsr;
     switch (w->opcode) {
     case CFT_WS_PING:
-        if (!w->close_sent) {
+        /* RFC 6455 allows answering only the latest PING; skip the PONG while output is backed up */
+        if (!w->close_sent && s->out.pending <= ws_limit(s)) {
             ws_send_frame(s, CFT_WS_PONG, w->ctrl, w->ctrl_len);
         }
         break;
@@ -729,7 +736,7 @@ static void ws_frame_done(cft_stream_t *s)
 static void ws_feed(cft_stream_t *s, const uint8_t *data, size_t len)
 {
     ws_rx_t *w = &s->wsr;
-    size_t max = s->conn->cfg.max_request_body ? s->conn->cfg.max_request_body : DEFAULT_MAX_BODY;
+    size_t max = ws_limit(s);
     while (len && !w->failed) {
         if (w->hdr_need == 0 && w->payload_left == 0 && w->hdr_len == 0) {
             w->hdr_need = 2;

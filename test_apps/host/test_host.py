@@ -373,6 +373,38 @@ def test_websocket_64bit_length(edge, connector, length):
     assert op == 8 and int.from_bytes(payload[:2], "big") == 1002
 
 
+def test_websocket_ping_flood(edge, connector):
+    """Pings from a visitor that does not read the replies queue a bounded number of PONGs"""
+    connector()
+    [conn] = edge.wait_registered()
+    count = 2000
+
+    async def session():
+        sid, _ = ws_open(conn)
+        s = conn.streams[sid]
+        await asyncio.wait_for(s.headers_received.wait(), 5)
+        r = WsReader(s)
+        conn.hold_window(sid)
+        conn.send_body(sid, b"".join(ws_frame(9, i.to_bytes(4, "big") * 31) for i in range(count)))
+        while sid in conn.pending:
+            await asyncio.sleep(0.05)
+        await asyncio.sleep(0.5)
+        conn.send_body(sid, ws_frame(1, b"close"))
+        await asyncio.sleep(0.2)
+        conn.release_window(sid)
+        pongs = 0
+        while True:
+            op, payload = await r.frame()
+            if op != 10:
+                return pongs, op, payload
+            pongs += 1
+
+    pongs, op, payload = edge.call(session())
+    # About (65535 bytes of stream window + 16 KiB queued) / 126-byte PONG frames
+    assert 0 < pongs < 1000, pongs
+    assert op == 8 and int.from_bytes(payload[:2], "big") == 1000
+
+
 # --- input validation of data from the edge ---
 
 def test_config_version_overflow(edge, connector):
