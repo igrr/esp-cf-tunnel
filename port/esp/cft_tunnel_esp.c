@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "cft_alloc.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "freertos/FreeRTOS.h"
@@ -55,7 +56,7 @@ esp_err_t cft_tunnel_start(const cft_tunnel_config_t *cfg, cft_tunnel_handle_t *
     if (!cfg || !cfg->token || !out) {
         return ESP_ERR_INVALID_ARG;
     }
-    struct cft_tunnel_esp *h = calloc(1, sizeof(*h));
+    struct cft_tunnel_esp *h = cft_data_calloc(1, sizeof(*h));
     if (!h) {
         return ESP_ERR_NO_MEM;
     }

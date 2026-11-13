@@ -3,6 +3,7 @@ idf_component_register(
         "src/cft_capnp.c"
         "src/cft_conn.c"
         "src/cft_debug.c"
+        "src/cft_h2_alloc.c"
         "src/cft_ingress.c"
         "src/cft_poll.c"
         "src/cft_proxy.c"

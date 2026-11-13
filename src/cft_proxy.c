@@ -16,6 +16,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "cft_alloc.h"
 #include "cft_conn.h"
 #include "cft_poll.h"
 #include "cft_port.h"
@@ -104,7 +105,7 @@ static int xbuf_append(xbuf_t *b, const void *data, size_t len)
         while (cap < b->len + len) {
             cap *= 2;
         }
-        uint8_t *np = realloc(b->p, cap);
+        uint8_t *np = cft_data_realloc(b->p, cap);
         if (!np) {
             return -1;
         }
@@ -885,8 +886,8 @@ int cft_proxy_start(cft_stream_t *s, const char *service, const char *host_heade
         CFT_LOGW(TAG, "too many origin connections, answering 503");
         return cft_stream_respond(s, 503, NULL, NULL, 0); /* load shedding, as for too many streams */
     }
-    proxy_t *p = calloc(1, sizeof(*p));
-    if (!p || (host_header && !(p->host_header = strdup(host_header)))) {
+    proxy_t *p = cft_data_calloc(1, sizeof(*p));
+    if (!p || (host_header && !(p->host_header = cft_data_strdup(host_header)))) {
         free(p);
         return cft_stream_fail(s, 500);
     }

@@ -37,6 +37,7 @@ add_library(cf_tunnel STATIC
     ${CORE_DIR}/src/cft_capnp.c
     ${CORE_DIR}/src/cft_conn.c
     ${CORE_DIR}/src/cft_debug.c
+    ${CORE_DIR}/src/cft_h2_alloc.c
     ${CORE_DIR}/src/cft_ingress.c
     ${CORE_DIR}/src/cft_poll.c
     ${CORE_DIR}/src/cft_proxy.c
@@ -58,6 +59,7 @@ target_compile_definitions(cf_tunnel PUBLIC CFT_DEBUG_STATS)
 target_sources(cf_tunnel PRIVATE fault.c)
 set_source_files_properties(
     ${CORE_DIR}/src/cft_capnp.c ${CORE_DIR}/src/cft_conn.c ${CORE_DIR}/src/cft_debug.c
+    ${CORE_DIR}/src/cft_h2_alloc.c
     ${CORE_DIR}/src/cft_ingress.c ${CORE_DIR}/src/cft_poll.c ${CORE_DIR}/src/cft_proxy.c
     ${CORE_DIR}/src/cft_rpc.c ${CORE_DIR}/src/cft_squeue.c ${CORE_DIR}/src/cft_token.c
     ${CORE_DIR}/src/cft_tunnel.c ${CORE_DIR}/src/cft_util.c
@@ -80,3 +82,30 @@ add_executable(util_test util_test.c)
 target_include_directories(util_test PRIVATE ${CORE_DIR}/src)
 target_link_libraries(util_test cf_tunnel)
 cft_warnings(util_test)
+
+# Exercise production and debug allocators with host heap-capability stubs.
+foreach(target psram_memory_test psram_memory_stats_test psram_prefer_memory_test psram_prefer_memory_stats_test)
+    add_executable(${target} psram_memory_test.c ${CORE_DIR}/src/cft_h2_alloc.c ${CORE_DIR}/src/cft_debug.c)
+    target_include_directories(${target} PRIVATE ${CORE_DIR}/src psram_stubs)
+    target_compile_definitions(${target} PRIVATE ESP_PLATFORM=1)
+    target_compile_options(${target} PRIVATE -Wundef)
+    target_link_libraries(${target} PRIVATE ${NGHTTP2_LIB})
+    if(target MATCHES "prefer")
+        target_compile_definitions(${target} PRIVATE CFT_TEST_ALLOC_PREFER=1)
+    else()
+        target_compile_definitions(${target} PRIVATE CFT_TEST_ALLOC_ONLY=1)
+    endif()
+    if(target MATCHES "stats")
+        target_compile_definitions(${target} PRIVATE CFT_DEBUG_STATS)
+    endif()
+    cft_warnings(${target})
+endforeach()
+
+# A disabled CONFIG_SPIRAM is absent from sdkconfig.h, as on ESP-IDF.
+foreach(target alloc_memory_test alloc_internal_memory_test)
+    add_executable(${target} alloc_memory_test.c)
+    target_include_directories(${target} PRIVATE ${CORE_DIR}/src psram_stubs)
+    target_compile_options(${target} PRIVATE -Wundef)
+    cft_warnings(${target})
+endforeach()
+target_compile_definitions(alloc_internal_memory_test PRIVATE ESP_PLATFORM=1 CFT_TEST_NO_PSRAM=1)

@@ -15,6 +15,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "cft_alloc.h"
 #include "cf_tunnel_esp.h"
 #include "esp_log.h"
 #include "esp_random.h"
@@ -143,7 +144,7 @@ static void *esp_open(void *ctx, const char *host, uint16_t port, const char *sn
         return NULL;
     }
 #endif
-    esp_conn_t *c = calloc(1, sizeof(*c));
+    esp_conn_t *c = cft_data_calloc(1, sizeof(*c));
     if (!c) {
         return NULL;
     }

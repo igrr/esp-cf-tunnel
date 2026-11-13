@@ -4,6 +4,7 @@
 #include <string.h>
 #include <strings.h>
 
+#include "cft_alloc.h"
 #include "cft_ingress.h"
 #include "cft_port.h"
 #include "cft_util.h"
@@ -39,7 +40,7 @@ static bool get_str(const char *json, size_t len, const char *key, char **out)
     if (rv == 0 || buf[0] == '\0') {
         return true;
     }
-    *out = strdup(buf);
+    *out = cft_data_strdup(buf);
     return *out != NULL;
 }
 
@@ -111,7 +112,7 @@ static void parse_rule(const char *json, size_t len, size_t idx, bool default_ok
     } else if (!host_header && !default_ok) {
         ok = false;
     } else if (!host_header && default_host_header) {
-        host_header = strdup(default_host_header);
+        host_header = cft_data_strdup(default_host_header);
         ok = ok && host_header;
     }
     if (!ok || !service) {
@@ -131,7 +132,7 @@ cft_ingress_t *cft_ingress_parse(const char *json, size_t len)
     if (!cft_json_get_raw(json, len, "ingress", &list, &list_len)) {
         return NULL;
     }
-    cft_ingress_t *ing = calloc(1, sizeof(*ing));
+    cft_ingress_t *ing = cft_data_calloc(1, sizeof(*ing));
     if (!ing) {
         return NULL;
     }
@@ -147,7 +148,7 @@ cft_ingress_t *cft_ingress_parse(const char *json, size_t len)
     while (cft_json_array_next(list, list_len, &pos, &elem, &elem_len)) {
         n++;
     }
-    ing->rules = calloc(n ? n : 1, sizeof(rule_t));
+    ing->rules = cft_data_calloc(n ? n : 1, sizeof(rule_t));
     if (!ing->rules) {
         free(default_host_header);
         free(ing);

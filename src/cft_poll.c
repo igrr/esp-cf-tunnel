@@ -1,5 +1,6 @@
 #include <stdlib.h>
 
+#include "cft_alloc.h"
 #include "cft_poll.h"
 
 struct cft_poll_entry {
@@ -21,7 +22,7 @@ struct cft_poller {
 
 cft_poller_t *cft_poller_new(unsigned max_entries)
 {
-    cft_poller_t *p = calloc(1, sizeof(cft_poller_t));
+    cft_poller_t *p = cft_data_calloc(1, sizeof(cft_poller_t));
     if (p) {
         p->max = max_entries;
     }
@@ -63,7 +64,7 @@ cft_poll_entry_t *cft_poll_add(cft_poller_t *p, int fd, cft_poll_fn fn, void *ar
     if (p->count >= p->max) {
         return NULL;
     }
-    cft_poll_entry_t *e = calloc(1, sizeof(*e));
+    cft_poll_entry_t *e = cft_data_calloc(1, sizeof(*e));
     if (!e) {
         return NULL;
     }

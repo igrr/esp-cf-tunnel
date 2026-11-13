@@ -1,5 +1,16 @@
 menu "Cloudflare Tunnel (esp-cf-tunnel)"
 
+    config CF_TUNNEL_PSRAM_FALLBACK
+        bool "Allow internal RAM fallback for PSRAM allocations"
+        depends on SPIRAM
+        default y
+        help
+            Tunnel-owned data and nghttp2 session allocations use PSRAM when
+            it is enabled. Allow internal RAM as a fallback when PSRAM cannot
+            satisfy a request. Disable this to reserve internal RAM for other
+            tasks; allocations then fail when PSRAM is exhausted. Task stacks
+            and SDK-managed allocations, such as TLS buffers, are unchanged.
+
     config CF_TUNNEL_TASK_STACK_SIZE
         int "Tunnel task stack size"
         default 8192
