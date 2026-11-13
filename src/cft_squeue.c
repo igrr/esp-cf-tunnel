@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "cft_alloc.h"
 #include "cft_debug.h"
 #include "cft_squeue.h"
 
@@ -13,7 +14,7 @@ int cft_sq_append(cft_squeue_t *q, const void *data, size_t len)
     cft_seg_t *first = NULL, *last = NULL;
     for (size_t need = len > room ? len - room : 0; need;) {
         size_t cap = need < CFT_SEG_MIN ? CFT_SEG_MIN : need > CFT_SEG_MAX ? CFT_SEG_MAX : need;
-        cft_seg_t *sg = malloc(sizeof(*sg) + cap);
+        cft_seg_t *sg = cft_data_malloc(sizeof(*sg) + cap);
         if (!sg) {
             while (first) {
                 cft_seg_t *next = first->next;

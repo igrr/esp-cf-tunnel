@@ -15,6 +15,7 @@
 #include <string.h>
 #include <sys/select.h>
 
+#include "cft_alloc.h"
 #include "cf_tunnel.h"
 #include "cft_conn.h"
 #include "cft_ingress.h"
@@ -301,7 +302,7 @@ static bool slot_flush(cft_tunnel_t *t, slot_t *s)
             return n == 0;
         }
         if (s->out_cap < (size_t)n) {
-            uint8_t *nb = realloc(s->out, (size_t)n);
+            uint8_t *nb = cft_data_realloc(s->out, (size_t)n);
             if (!nb) {
                 return false;
             }
@@ -360,7 +361,7 @@ cft_tunnel_t *cft_tunnel_new(const cft_tunnel_config_t *cfg, const cft_transport
     if (!cfg || !cfg->token || !transport) {
         return NULL;
     }
-    cft_tunnel_t *t = calloc(1, sizeof(*t));
+    cft_tunnel_t *t = cft_data_calloc(1, sizeof(*t));
     if (!t) {
         return NULL;
     }
@@ -394,7 +395,7 @@ cft_tunnel_t *cft_tunnel_new(const cft_tunnel_config_t *cfg, const cft_transport
         t->connector_id[6] = (t->connector_id[6] & 0x0f) | 0x40; /* UUID v4 */
         t->connector_id[8] = (t->connector_id[8] & 0x3f) | 0x80;
     }
-    t->rx = malloc(RX_BUF_SIZE);
+    t->rx = cft_data_malloc(RX_BUF_SIZE);
     t->poller = cft_poller_new(cfg->max_origin_connections ? cfg->max_origin_connections : DEFAULT_MAX_ORIGINS);
     if (!t->rx || !t->poller) {
         free(t->rx);
@@ -417,7 +418,7 @@ void cft_tunnel_request_stop(cft_tunnel_t *t, uint32_t stop_timeout_ms)
 
 int cft_tunnel_post(cft_tunnel_t *t, void (*fn)(void *arg), void *arg)
 {
-    post_t *p = malloc(sizeof(*p));
+    post_t *p = cft_data_malloc(sizeof(*p));
     if (!p) {
         return -1;
     }

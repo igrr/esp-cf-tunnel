@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "cft_alloc.h"
 #include "cft_capnp.h"
 #include "cft_port.h"
 
@@ -374,7 +375,7 @@ static int handle_message(cft_rpc_t *rpc, const cft_cpr_msg_t *m)
 cft_rpc_t *cft_rpc_new(const cft_rpc_register_params_t *params, cft_rpc_send_fn send, cft_rpc_event_fn on_event,
                        void *arg)
 {
-    cft_rpc_t *rpc = calloc(1, sizeof(*rpc));
+    cft_rpc_t *rpc = cft_data_calloc(1, sizeof(*rpc));
     if (!rpc) {
         return NULL;
     }
@@ -417,7 +418,7 @@ int cft_rpc_feed(cft_rpc_t *rpc, const uint8_t *data, size_t len)
         while (cap < rpc->rx_len + len) {
             cap *= 2;
         }
-        uint8_t *nb = realloc(rpc->rx, cap);
+        uint8_t *nb = cft_data_realloc(rpc->rx, cap);
         if (!nb) {
             emit_protocol_error(rpc, "out of memory%s", NULL);
             return -1;

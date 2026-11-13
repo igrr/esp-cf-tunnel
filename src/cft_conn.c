@@ -9,8 +9,10 @@
 #include <string.h>
 #include <strings.h>
 
+#include "cft_alloc.h"
 #include "cft_conn.h"
 #include "cft_debug.h"
+#include "cft_h2_alloc.h"
 #include "cft_port.h"
 #include "cft_rpc.h"
 #include "cft_squeue.h"
@@ -176,7 +178,7 @@ static int buf_append(buf_t *b, const void *data, size_t len)
         while (cap < b->len + len) {
             cap *= 2;
         }
-        uint8_t *np = realloc(b->p, cap);
+        uint8_t *np = cft_data_realloc(b->p, cap);
         if (!np) {
             return -1;
         }
@@ -195,7 +197,7 @@ static int buf_reserve(buf_t *b, size_t total)
     if (total <= b->cap) {
         return 0;
     }
-    uint8_t *np = realloc(b->p, total);
+    uint8_t *np = cft_data_realloc(b->p, total);
     if (!np) {
         return -1;
     }
@@ -345,7 +347,7 @@ static char *serialize_headers(const cft_header_t *h, size_t n)
         }
         len += cft_b64_raw_len(strlen(h[i].name)) + cft_b64_raw_len(strlen(h[i].value)) + 2;
     }
-    char *out = malloc(len);
+    char *out = cft_data_malloc(len);
     if (!out) {
         return NULL;
     }
@@ -571,7 +573,7 @@ void cft_stream_set_ws_raw(cft_stream_t *s)
 int cft_stream_set_service(cft_stream_t *s, const char *service)
 {
     free(s->service);
-    s->service = service ? strdup(service) : NULL;
+    s->service = service ? cft_data_strdup(service) : NULL;
     s->req.service = s->service;
     return service && !s->service ? -1 : 0;
 }
@@ -1020,13 +1022,13 @@ static int build_request(cft_stream_t *s)
 {
     buf_t *b = &s->hdrbuf;
     if (b->len && b->len < b->cap) {
-        uint8_t *p = realloc(b->p, b->len); /* give back the slack */
+        uint8_t *p = cft_data_realloc(b->p, b->len); /* give back the slack */
         if (p) {
             b->p = p;
             b->cap = b->len;
         }
     }
-    if (s->num_headers && !(s->headers = malloc(s->num_headers * sizeof(cft_header_t)))) {
+    if (s->num_headers && !(s->headers = cft_data_malloc(s->num_headers * sizeof(cft_header_t)))) {
         return -1;
     }
     size_t n = 0;
@@ -1157,7 +1159,7 @@ static int on_begin_headers(nghttp2_session *session, const nghttp2_frame *frame
     if (frame->hd.type != NGHTTP2_HEADERS || frame->headers.cat != NGHTTP2_HCAT_REQUEST) {
         return 0;
     }
-    cft_stream_t *s = calloc(1, sizeof(*s));
+    cft_stream_t *s = cft_data_calloc(1, sizeof(*s));
     if (!s) {
         return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE; /* resets this stream, not the connection */
     }
@@ -1364,60 +1366,11 @@ static int on_invalid_frame(nghttp2_session *session, const nghttp2_frame *frame
     return 0;
 }
 
-#ifdef CFT_DEBUG_STATS
-/* nghttp2 allocator that counts what nghttp2 holds */
-static void *h2_malloc(size_t size, void *ud)
-{
-    size_t *p = malloc(size + sizeof(size_t) * 2);
-    if (!p) {
-        return NULL;
-    }
-    p[0] = size;
-    CFT_DEBUG_ADD(h2_bytes, size);
-    CFT_DEBUG_PEAK(h2_bytes, h2_peak);
-    return p + 2;
-}
-
-static void h2_free(void *ptr, void *ud)
-{
-    if (ptr) {
-        size_t *p = (size_t *)ptr - 2;
-        CFT_DEBUG_ADD(h2_bytes, -p[0]);
-        free(p);
-    }
-}
-
-static void *h2_calloc(size_t n, size_t size, void *ud)
-{
-    void *p = h2_malloc(n * size, ud);
-    if (p) {
-        memset(p, 0, n * size);
-    }
-    return p;
-}
-
-static void *h2_realloc(void *ptr, size_t size, void *ud)
-{
-    if (!ptr) {
-        return h2_malloc(size, ud);
-    }
-    size_t old = ((size_t *)ptr - 2)[0];
-    void *np = h2_malloc(size, ud);
-    if (np) {
-        memcpy(np, ptr, old < size ? old : size);
-        h2_free(ptr, ud);
-    }
-    return np;
-}
-
-static nghttp2_mem h2_mem = {NULL, h2_malloc, h2_free, h2_calloc, h2_realloc};
-#endif
-
 /* --- connection API --- */
 
 cft_conn_t *cft_conn_new(const cft_conn_config_t *cfg)
 {
-    cft_conn_t *c = calloc(1, sizeof(*c));
+    cft_conn_t *c = cft_data_calloc(1, sizeof(*c));
     if (!c) {
         return NULL;
     }
@@ -1446,8 +1399,8 @@ cft_conn_t *cft_conn_new(const cft_conn_config_t *cfg)
     }
     /* Received data is acknowledged once consumed: see cft_stream_pause_body() */
     nghttp2_option_set_no_auto_window_update(opt, 1);
-#ifdef CFT_DEBUG_STATS
-    int rv = nghttp2_session_server_new3(&c->h2, cbs, c, opt, &h2_mem);
+#if defined(CFT_DEBUG_STATS) || defined(CFT_ALLOC_PSRAM)
+    int rv = nghttp2_session_server_new3(&c->h2, cbs, c, opt, cft_h2_mem());
 #else
     int rv = nghttp2_session_server_new2(&c->h2, cbs, c, opt);
 #endif
@@ -1534,7 +1487,7 @@ static uint8_t *fix_goaway(cft_conn_t *c, const uint8_t *data, size_t len)
                 for (size_t j = 0; j < k && c->payload_pos + j < 4; j++) {
                     if (data[i + j] != 0) {
                         if (!patched) {
-                            patched = malloc(len);
+                            patched = cft_data_malloc(len);
                             if (!patched) {
                                 return NULL;
                             }
